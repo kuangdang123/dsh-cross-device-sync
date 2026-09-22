@@ -8,10 +8,13 @@
  *   dsh-sync pull              预检 → git pull --ff-only → 更新台账
  *   dsh-sync push              预检 → 更新台账 → add/commit/push
  *   dsh-sync sync              pull + push
+ *   dsh-sync diagnose          排查「面板没数据」：挂载标记 / profile 注册 / 客户端产物 / 上次同步
  *
  * 退出码：0 正常 · 2 冲突 · 3 git 问题 · 4 完整性问题
  */
-import { classify, deviceId, git, hasRemote, init, isRepo, preflight, resolveHome, status, sync, verifyAll, walkSessions, writeLedger } from '../src/engine.js'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { join } from 'node:path'
+import { classify, deviceId, git, hasRemote, init, isRepo, preflight, readMountMarker, resolveHome, status, sync, verifyAll, walkSessions, writeLedger } from '../src/engine.js'
 
 const HOME = resolveHome()
 const argv = process.argv.slice(2)
@@ -135,6 +138,88 @@ function cmdPush() {
   say(paint.grn(`push 完成（设备 ${pre.device}）`))
 }
 
+/**
+ * diagnose：把「为什么面板没数据」拆成可判定的几条。
+ * 只读磁盘，不连服务、不改状态。
+ */
+function cmdDiagnose() {
+  const profile = join(HOME, 'profiles', 'web')
+  const manifestPath = join(profile, 'package.json')
+  const clientArtifact = join(profile, 'node_modules', 'dsh-cross-device-sync', 'lib', 'client.js')
+
+  say(paint.b('=== 环境 ==='))
+  say(`DSH_HOME            ${HOME}`)
+  let device = '(未初始化，先跑 init)'
+  try {
+    device = deviceId(HOME)
+  } catch {
+    // 还没 init 是正常状态，如实显示即可。
+  }
+  say(`设备身份            ${device}`)
+  say(`profile 目录        ${profile}`)
+
+  say('')
+  say(paint.b('=== Host 半边（插件行）==='))
+  const marker = readMountMarker(HOME)
+  if (marker === undefined) {
+    say(paint.yel('挂载标记            不存在 → Host 半边从未在这个 DSH_HOME 里 apply'))
+    say(paint.dim('  面板会显示「Host 半边未挂载」。先确认插件行在组合树里，再重启 profile。'))
+  } else {
+    say(`挂载标记            ${join(HOME, '.dsh-sync', 'host-mount.json')}`)
+    say(`  stage             ${marker.stage === 'routes-registered' ? paint.grn(String(marker.stage)) : paint.yel(String(marker.stage))}`)
+    say(`  at / pid / node   ${marker.at ?? '-'} / ${marker.pid ?? '-'} / ${marker.node ?? '-'}`)
+    say(`  代码位置           ${marker.packagePath ?? '-'}`)
+    if (marker.route !== undefined && marker.route !== null) say(`  route             ${marker.route}`)
+    if (marker.stage === 'applied') say(paint.yel('  → 已 apply 但 webServer 始终没出现，路由未注册'))
+    if (marker.stage === 'webServer-available') say(paint.yel('  → webServer 已就绪但 effect 还没跑完'))
+  }
+
+  say('')
+  say(paint.b('=== profile 注册状态 ==='))
+  if (!existsSync(manifestPath)) {
+    say(paint.yel(`找不到 ${manifestPath}`))
+  } else {
+    let manifest
+    try {
+      manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    } catch (error) {
+      manifest = undefined
+      say(paint.red(`profile package.json 解析失败：${error}`))
+    }
+    if (manifest !== undefined) {
+      const dep = manifest.dependencies?.['dsh-cross-device-sync'] ?? '(不在 dependencies)'
+      const bundles = manifest.dsh?.profile?.bundles ?? []
+      const inBundles = bundles.includes('dsh-cross-device-sync')
+      say(`依赖                ${dep}`)
+      say(`bundles 列表        ${inBundles ? paint.grn('含 dsh-cross-device-sync') : paint.red('不含 → 插件行不会进插件树')}`)
+    }
+  }
+  if (existsSync(clientArtifact)) {
+    const st = statSync(clientArtifact)
+    say(`客户端产物          ${clientArtifact}`)
+    say(`                    ${st.size} B，${new Date(st.mtimeMs).toLocaleString()}`)
+  } else {
+    say(paint.yel(`客户端产物不存在：${clientArtifact}（先跑 node build/build-client.mjs）`))
+  }
+
+  say('')
+  say(paint.b('=== 最近一次同步 ==='))
+  const statusFile = join(HOME, '.dsh-sync', 'status.json')
+  if (existsSync(statusFile)) {
+    try {
+      const s = JSON.parse(readFileSync(statusFile, 'utf8'))
+      say(`status.json         ok=${s.ok} reason=${s.reason} at=${s.at}`)
+      if (s.error) say(paint.yel(`  上次错误          ${s.error}`))
+    } catch (error) {
+      say(paint.yel(`status.json 读不动：${error}`))
+    }
+  } else {
+    say(paint.dim('status.json         不存在（Host 半边还没挂载过，或还没触发同步）'))
+  }
+  const ledgers = existsSync(join(HOME, '.dsh-sync')) ? readdirSync(join(HOME, '.dsh-sync')).filter(n => n.startsWith('ledger-')) : []
+  say(`台账文件            ${ledgers.length === 0 ? '(无)' : ledgers.join(', ')}`)
+}
+
 function cmdSync() {
   if (dryRun) {
     cmdPull()
@@ -147,7 +232,7 @@ function cmdSync() {
   say(paint.grn(`同步完成 pull=${result.pulled} commit=${result.committed} push=${result.pushed}（设备 ${pre.device}）`))
 }
 
-const cmds = { init: cmdInit, status: cmdStatus, verify: cmdVerify, pull: cmdPull, push: cmdPush, sync: cmdSync }
+const cmds = { init: cmdInit, status: cmdStatus, verify: cmdVerify, pull: cmdPull, push: cmdPush, sync: cmdSync, diagnose: cmdDiagnose }
 if (!(cmd in cmds)) die(1, `未知子命令：${cmd}\n可用：${Object.keys(cmds).join(', ')}`)
 say(paint.dim(`DSH_HOME=${HOME}${dryRun ? '  [dry-run]' : ''}`))
 cmds[cmd]()

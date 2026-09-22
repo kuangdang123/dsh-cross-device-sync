@@ -20,6 +20,38 @@ export function resolveHome(env = process.env) {
   return env.DSH_HOME ?? join(homedir(), '.dsh')
 }
 
+// ── 挂载标记：让「Host 半边到底有没有跑起来」可被外部检查 ────────────────────
+/**
+ * Host 半边每次进入一个阶段就覆写一次标记。这一步存在的唯一理由是可诊断性：
+ * 插件行没挂载、webServer 迟迟不出现、apply 抛错，这三种情况从外面都表现为
+ * 「面板没数据」，而标记能直接区分它们。
+ * @param home - DSH_HOME
+ * @param payload - 阶段信息（stage/route/webServer/pid…）
+ * @returns 标记文件路径；写不进去时返回 undefined
+ */
+export function writeMountMarker(home, payload) {
+  try {
+    mkdirSync(join(home, '.dsh-sync'), { recursive: true })
+    const file = join(home, '.dsh-sync', 'host-mount.json')
+    writeFileSync(file, JSON.stringify({ at: new Date().toISOString(), ...payload }, null, 2))
+    return file
+  } catch {
+    // 标记只是诊断产物：磁盘只读或权限不足时不该让插件本身起不来。
+    return undefined
+  }
+}
+
+/** 读挂载标记；不存在返回 undefined（＝ 这个 HOME 里 Host 半边从未 apply）。 */
+export function readMountMarker(home) {
+  const file = join(home, '.dsh-sync', 'host-mount.json')
+  if (!existsSync(file)) return undefined
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    return { at: null, stage: 'unreadable' }
+  }
+}
+
 // ── 设备身份 ────────────────────────────────────────────────────────────────
 export function deviceId(home, { create = false } = {}) {
   const file = join(home, '.device-id')

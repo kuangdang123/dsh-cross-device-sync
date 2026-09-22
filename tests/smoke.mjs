@@ -15,6 +15,7 @@ const { apply } = await import('../src/index.js')
 
 const listeners = new Map()
 const effects = []
+const routes = []
 const ctx = {
   logger: { info: () => {}, warn: () => {}, error: () => {} },
   on(name, fn) {
@@ -25,6 +26,25 @@ const ctx = {
     const disposer = fn()
     effects.push(disposer)
     return disposer
+  },
+  // 真实 cordis 里 inject 只在依赖就绪后回调；桩里立即满足，并把带 webServer 的 scope 交给回调。
+  inject(deps, callback) {
+    return callback({
+      effect(fn) {
+        const disposer = fn()
+        effects.push(disposer)
+        return disposer
+      },
+      webServer: {
+        register(registration) {
+          routes.push(registration)
+          return () => {
+            const index = routes.indexOf(registration)
+            if (index >= 0) routes.splice(index, 1)
+          }
+        },
+      },
+    })
   },
   get() {
     return undefined
@@ -38,6 +58,14 @@ assert.ok(existsSync(join(home, '.device-id')), '首次挂载应生成 .device-i
 assert.ok(listeners.has('agent/status'), '应监听 agent/status')
 assert.ok(listeners.has('session/disposed'), '应监听 session/disposed')
 assert.ok(existsSync(join(home, '.dsh-sync', 'status.json')), '挂载应写一次状态文件')
+assert.equal(routes.length, 1, 'webServer 就绪后应注册一条路由')
+assert.equal(routes[0].path, '/cross-device-sync', '路由前缀应为 /cross-device-sync')
+
+// 挂载标记：这是「面板没数据」时唯一能从外面看到的事实来源
+const marker = JSON.parse(readFileSync(join(home, '.dsh-sync', 'host-mount.json'), 'utf8'))
+assert.equal(marker.stage, 'routes-registered', '挂载标记应停在 routes-registered')
+assert.equal(marker.route, '/cross-device-sync')
+assert.equal(typeof marker.pid, 'number', '标记应带 pid，便于与系统进程对照')
 
 // 触发一次「回合收尾」：临时目录不是 git 仓库，所以同步必然失败，
 // 但失败必须被记录成结构化状态，而不是抛出或静默。

@@ -23,14 +23,25 @@ const ctx = {
     effects.push(disposer)
     return disposer
   },
-  get: name => (name === 'webServer'
-    ? { register: registration => {
-        route = registration
-        return () => {
-          route = null
-        }
-      } }
-    : undefined),
+  // 插件用 ctx.inject(['webServer'], …) 等 webServer 就绪；桩里立即满足。
+  inject(deps, callback) {
+    return callback({
+      effect: fn => {
+        const disposer = fn()
+        effects.push(disposer)
+        return disposer
+      },
+      webServer: {
+        register: registration => {
+          route = registration
+          return () => {
+            route = null
+          }
+        },
+      },
+    })
+  },
+  get: () => undefined,
 }
 
 apply(ctx, { enabled: true, debounceSeconds: 0 })

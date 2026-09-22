@@ -13,19 +13,22 @@ const PANEL_ID = 'cross-device-sync'
 const BASE = '/cross-device-sync'
 
 async function request(path, init) {
+  const url = `${BASE}${path}`
   let res
   try {
-    res = await fetch(`${BASE}${path}`, init)
+    res = await fetch(url, init)
   } catch (err) {
-    return { ok: false, error: `取不到 ${BASE}${path}：${err instanceof Error ? err.message : String(err)}` }
+    return { ok: false, error: `取不到 ${url}：${err instanceof Error ? err.message : String(err)}`, diag: { url, status: null, contentType: null, body: null } }
   }
   const type = res.headers.get('content-type') || ''
   const text = await res.text()
+  const diag = { url, status: res.status, contentType: type || '(空)', body: text.slice(0, 160) }
   // Host 半边没挂载时请求会落到 SPA fallback，拿回一段 HTML——必须与真正的接口错误区分开，
-  // 否则用户只看到「毫无反应」。
+  // 否则用户只看到「毫无反应」。诊断块把这几个原始事实直接摆出来。
   if (!type.includes('json')) {
     return {
       ok: false,
+      diag,
       error: res.status === 404
         ? 'Host 半边未挂载：插件行只在 profile 启动时组合，请重启 web profile'
         : `Host 半边未就绪（HTTP ${res.status}，content-type=${type || '空'}）——重启 web profile 后重试`,
@@ -34,7 +37,7 @@ async function request(path, init) {
   try {
     return JSON.parse(text)
   } catch {
-    return { ok: false, error: `响应不是合法 JSON（HTTP ${res.status}）` }
+    return { ok: false, diag, error: `响应不是合法 JSON（HTTP ${res.status}）` }
   }
 }
 
@@ -120,14 +123,22 @@ function Panel() {
   const [status, setStatus] = React.useState(null)
   const [sessions, setSessions] = React.useState([])
   const [error, setError] = React.useState(null)
+  const [diag, setDiag] = React.useState(null)
   const [selected, setSelected] = React.useState('all')
   const [busy, setBusy] = React.useState(false)
 
   const refresh = React.useCallback(async () => {
     try {
       const [st, ss] = await Promise.all([request('/status'), request('/sessions')])
-      if (st.ok === false) throw new Error(st.error || '状态接口失败')
-      if (ss.ok === false) throw new Error(ss.error || '会话接口失败')
+      if (st.ok === false) {
+        setDiag(st.diag ?? null)
+        throw new Error(st.error || '状态接口失败')
+      }
+      if (ss.ok === false) {
+        setDiag(ss.diag ?? null)
+        throw new Error(ss.error || '会话接口失败')
+      }
+      setDiag(null)
       setStatus(st)
       setSessions(ss.sessions || [])
       setError(null)
@@ -191,6 +202,15 @@ function Panel() {
       ),
     ),
     error ? h('div', { style: { color: 'inherit', opacity: 0.9, fontSize: '12px', margin: '6px 0' } }, `⚠ ${error}`) : null,
+    diag
+      ? h(
+          'div',
+          { style: { ...dim, fontFamily: 'ui-monospace, monospace', fontSize: '11px', margin: '2px 0 6px', wordBreak: 'break-all' } },
+          `诊断：${diag.url} → HTTP ${diag.status ?? '无响应'} · content-type=${diag.contentType ?? '-'}`,
+          diag.body ? h('div', null, `body 前 160 字：${diag.body}`) : null,
+          h('div', { style: { marginTop: '2px' } }, 'Host 端点应为 JSON；拿到 HTML/404 说明插件行没挂载（重启 profile）'),
+        )
+      : null,
     status && status.conflicts && status.conflicts.length > 0
       ? h(
           'div',

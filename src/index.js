@@ -8,11 +8,14 @@
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { deviceId, preflight, resolveHome, status as engineStatus, sessionSummaries, sync, writeLedger, git, isRepo, hasRemote } from './engine.js'
+import { deviceId, preflight, resolveHome, status as engineStatus, sessionSummaries, sync, writeLedger, writeMountMarker, git, isRepo, hasRemote } from './engine.js'
 import { registerRoutes } from './routes.js'
 
 export const name = 'cross-device-sync'
 export const inject = []
+
+/** 本文件所在目录，写进挂载标记，便于确认“跑的是哪份代码”。 */
+const packagePath = import.meta.dirname
 
 const DEFAULTS = Object.freeze({
   enabled: true,
@@ -200,14 +203,31 @@ export function apply(ctx, rowConfig = {}) {
     },
   }
 
-  // Client 半边通过这里取数；没有 webServer 时插件仍然工作（只是面板读不到数据）。
-  const webServer = ctx.get('webServer')
-  if (webServer !== undefined) {
-    ctx.effect(() => registerRoutes(webServer, api), 'cross-device-sync: http routes')
-    log.info?.('cross-device-sync: HTTP 路由已挂载（/cross-device-sync/status|sessions|run）')
-  } else {
-    log.warn?.('cross-device-sync: 未找到 webServer，UI 面板将读不到数据')
-  }
+  // Client 半边通过这里取数。这里刻意用 ctx.inject 而不是 ctx.get：
+  // ctx.get 在 apply 这一刻可能还拿不到 webServer，而那种失败是静默的（只留一行 warn），
+  // 正是 v0.1.0 第一次上线时踩的坑。每进入一个阶段都覆写挂载标记，便于外部诊断。
+  const marker = payload => writeMountMarker(home, {
+    stage: payload.stage,
+    webServer: payload.webServer,
+    route: payload.route,
+    device,
+    pid: process.pid,
+    node: process.version,
+    home,
+    packagePath,
+  })
+
+  marker({ stage: 'applied', webServer: false, route: null })
+
+  ctx.inject(['webServer'], webCtx => {
+    marker({ stage: 'webServer-available', webServer: true, route: null })
+    return webCtx.effect(() => {
+      const dispose = registerRoutes(webCtx.webServer, api)
+      marker({ stage: 'routes-registered', webServer: true, route: '/cross-device-sync' })
+      log.info?.('cross-device-sync: HTTP 路由已挂载（/cross-device-sync/status|sessions|run）')
+      return dispose
+    }, 'cross-device-sync: http routes')
+  })
 
   return api
 }
