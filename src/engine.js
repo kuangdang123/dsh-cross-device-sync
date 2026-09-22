@@ -6,8 +6,8 @@
  *   - resume 使用日志里记录的 cwd 且不做校验，所以路径靠 devices.yaml 对齐；
  *   - 顺序使用下没有跨机并发写，真正的风险是「未同步窗口」——由台账检出。
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, openSync, readSync, closeSync } from 'node:fs'
-import { join, relative, sep } from 'node:path'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync, renameSync, statSync, openSync, readSync, closeSync } from 'node:fs'
+import { join, relative, sep, dirname } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -353,6 +353,75 @@ export function unmerged(home) {
   return (git(home, ['diff', '--name-only', '--diff-filter=U']).stdout ?? '').trim().split('\n').filter(Boolean)
 }
 
+// ── 「绝不同步」闸门 ─────────────────────────────────────────────────────────
+/**
+ * 本机身份与凭据：绝不进任何 git 通道。
+ * 只写 .gitignore 不够——用户手改一次 ignore 就破防，所以还要一道查索引的硬闸门。
+ */
+export const NEVER_SYNC_SENSITIVE = Object.freeze([
+  '.credentials.yaml',
+  '.device-id',
+  '.anonymous-user-id',
+])
+
+/** 机器本地或体积过大：不随 git 走（每台设备自己生成 / 重装）。 */
+export const NEVER_SYNC_LOCAL = Object.freeze([
+  'profiles/',
+  'electron/',
+  'cache/',
+  'logs/',
+  'tools/',
+  'dsh-pet/',
+  'storages/',
+  '.dsh-sync/status.json',
+  '.dsh-sync/host-mount.json',
+  '.dsh-sync/trash/',
+])
+
+/**
+ * 命中「绝不同步」的入库路径：已跟踪的（ls-files）与会被 `add -A` 捕获的（status）。
+ * 后者包含「未跟踪且未被 ignore」——那正是 `git add -A` 会吃进去的集合。
+ * @param home - DSH_HOME
+ * @returns 相对 HOME 的路径，已排序
+ */
+export function escapedNeverSyncPaths(home) {
+  if (!isRepo(home)) return []
+  const patterns = [...NEVER_SYNC_SENSITIVE, ...NEVER_SYNC_LOCAL]
+  const matches = name => patterns.some(p => (p.endsWith('/') ? name.startsWith(p) : name === p))
+  const found = new Set()
+  for (const line of (git(home, ['ls-files']).stdout ?? '').split('\n')) {
+    const name = line.trim()
+    if (name.length > 0 && matches(name)) found.add(name)
+  }
+  // porcelain 第 3 列起是路径；重命名条目是 `old -> new`，两侧都要判。
+  for (const line of (git(home, ['status', '--porcelain', '-uall']).stdout ?? '').split('\n')) {
+    if (line.trim().length === 0) continue
+    for (const candidate of line.slice(3).trim().split(' -> ')) {
+      const name = candidate.trim()
+      if (name.length > 0 && matches(name)) found.add(name)
+    }
+  }
+  return [...found].sort()
+}
+
+/**
+ * 写好受管 ignore 后确认「绝不同步」的路径不会进 git；命中即抛错（失败要响）。
+ * @param home - DSH_HOME
+ * @returns 受管 ignore 的写入结果
+ * @throws {Error} 当敏感/机器本地路径已被跟踪，或仍会被 `git add -A` 捕获
+ */
+export function guardNeverSync(home) {
+  const ignored = syncManagedIgnores(home)
+  const escaped = escapedNeverSyncPaths(home)
+  if (escaped.length > 0) {
+    throw new Error(
+      `这些路径绝不该进 git，但已被跟踪或仍会被 git add -A 捕获：${escaped.join(', ')}。`
+      + '先 `git rm --cached <路径>` 并确认 .gitignore 的受管块未被改动，再同步。',
+    )
+  }
+  return ignored
+}
+
 // ── 对外动作 ────────────────────────────────────────────────────────────────
 /** 台账里的设备清单：UI 的「设备筛选」用它，本机永远在列（即使还没写过台账）。 */
 export function devicesFromLedgers(home, me) {
@@ -442,7 +511,8 @@ export function sync(home, { commit = true, push = true } = {}) {
     result.pulled = true
     // pull 之后再改写 .gitignore：带着脏工作区 pull 会被 git 拒绝。
     // 归档会话必须进 .gitignore，否则下面的 add -A 会把它们提交进仓库。
-    result.ignored = syncArchivedIgnores(home)
+    // guardNeverSync 会写好受管 ignore，并确认敏感/机器本地文件没有被跟踪、也不会被 add -A 捕获。
+    result.ignored = guardNeverSync(home)
     writeLedger(home, pre.device, pre.sessions)
     if (!commit) return result
     git(home, ['add', '-A'])
@@ -569,43 +639,91 @@ export function archivedSessionDirs(home) {
   return out
 }
 
-const IGNORE_BEGIN = '# >>> dsh-sync 归档会话（自动生成，勿手改） >>>'
-const IGNORE_END = '# <<< dsh-sync 归档会话 <<<'
+/** 受管 ignore 的区块标题，同时是 .gitignore 里的标记文本。 */
+const ARCHIVED_IGNORE_TITLE = '归档会话（自动生成，勿手改）'
+const MANAGED_IGNORE_BLOCKS = [
+  { title: '敏感身份与凭据（绝不同步）', entries: () => NEVER_SYNC_SENSITIVE },
+  { title: '机器本地与体积（不同步）', entries: () => NEVER_SYNC_LOCAL },
+  { title: ARCHIVED_IGNORE_TITLE, entries: home => archivedSessionDirs(home).map(d => `${d.rel}/`) },
+]
+const ignoreBegin = title => `# >>> dsh-sync ${title} >>>`
+const ignoreEnd = title => `# <<< dsh-sync ${title} <<<`
 
 /**
- * 在 .gitignore 里维护受管区块，列出归档会话目录。
- * 为什么必须这样做：归档排除只影响"我们遍历什么"，而 `git add -A` 看的是文件系统——
- * 不写进 .gitignore，归档的会话照样会被提交进仓库（实测踩过一次：95 个文件里 38 个是归档）。
+ * 维护 .gitignore 里的受管区块：敏感身份 / 机器本地 / 归档会话。
+ * 为什么必须写：`git add -A` 看的是文件系统，不写进 .gitignore 就会被提交；
+ * 实测踩过一次：95 个文件里 38 个是归档。凭据同理，且后果不可逆。
  * @param home - DSH_HOME
- * @returns 受管条目数与是否改动
+ * @returns 各区块条目数与是否改动
  */
-export function syncArchivedIgnores(home) {
+export function syncManagedIgnores(home) {
   const file = join(home, '.gitignore')
-  const dirs = archivedSessionDirs(home)
-  const block = dirs.length === 0 ? '' : [IGNORE_BEGIN, ...dirs.map(d => `${d.rel}/`), IGNORE_END, ''].join('\n')
   const current = existsSync(file) ? readFileSync(file, 'utf8') : ''
-  const start = current.indexOf(IGNORE_BEGIN)
-  const end = current.indexOf(IGNORE_END)
-  const base = start >= 0 && end > start
-    ? current.slice(0, start) + current.slice(end + IGNORE_END.length + 1)
-    : current
-  const trimmed = base.replace(/\s*$/, '')
-  const next = block === '' ? `${trimmed}\n` : `${trimmed}\n\n${block}`
-  if (next === current) return { entries: dirs.length, changed: false, file }
+  const counts = {}
+  const bodies = []
+  let rest = current
+  for (const block of MANAGED_IGNORE_BLOCKS) {
+    const entries = block.entries(home)
+    counts[block.title] = entries.length
+    const begin = ignoreBegin(block.title)
+    const end = ignoreEnd(block.title)
+    const start = rest.indexOf(begin)
+    const stop = rest.indexOf(end)
+    if (start >= 0 && stop > start) rest = rest.slice(0, start) + rest.slice(stop + end.length)
+    if (entries.length > 0) bodies.push([begin, ...entries, end].join('\n'))
+  }
+  const head = rest.replace(/\s+$/, '')
+  const next = [...(head.length > 0 ? [head] : []), ...bodies].join('\n\n') + '\n'
+  if (next === current) return { counts, changed: false, file }
   writeFileSync(file, next)
-  return { entries: dirs.length, changed: true, file }
+  return { counts, changed: true, file }
 }
 
 /**
- * 删除本地已归档的会话目录。归档不进同步，删掉不影响任何设备的台账。
- * 默认只列不删（护栏：先看清单，再 --apply）。
+ * 兼容旧调用：只关心归档区块的条目数。
+ * @param home - DSH_HOME
+ * @returns 归档条目数与是否改动
+ */
+export function syncArchivedIgnores(home) {
+  const managed = syncManagedIgnores(home)
+  return { entries: managed.counts[ARCHIVED_IGNORE_TITLE] ?? 0, changed: managed.changed, file: managed.file }
+}
+/**
+ * 把本地已归档的会话移入回收站，而不是删除。
+ * dsh 的「归档」是隐藏、数据保留；这里也保持可恢复，默认只列清单。
+ * @param home - DSH_HOME
+ * @param options.apply - 真的移入 .dsh-sync/trash/<时间戳>/
+ * @returns 归档标记数、命中目录、以及回收站路径（未应用时为 null）
  */
 export function pruneArchived(home, { apply = false } = {}) {
   const targets = archivedSessionDirs(home)
-  if (apply) for (const target of targets) rmSync(target.dir, { recursive: true, force: true })
-  return { archived: archivedSessionIds(home).size, targets, applied: apply }
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const trash = join(home, '.dsh-sync', 'trash', stamp)
+  if (apply) {
+    for (const target of targets) {
+      const dest = join(trash, target.project, target.id)
+      mkdirSync(dirname(dest), { recursive: true })
+      renameSync(target.dir, dest)
+    }
+  }
+  return { archived: archivedSessionIds(home).size, targets, applied: apply, trash: apply ? trash : null }
 }
 
+/**
+ * 清空回收站：这是唯一真正删除归档会话的地方，必须显式调用。
+ * @param home - DSH_HOME
+ * @returns 删除的目录数与字节数
+ */
+export function emptyTrash(home) {
+  const root = join(home, '.dsh-sync', 'trash')
+  if (!existsSync(root)) return { dirs: 0, bytes: 0 }
+  const size = dir => readdirSync(dir, { withFileTypes: true })
+    .reduce((sum, e) => sum + (e.isDirectory() ? size(join(dir, e.name)) : statSync(join(dir, e.name)).size), 0)
+  const dirs = readdirSync(root, { withFileTypes: true }).filter(e => e.isDirectory()).length
+  const bytes = size(root)
+  rmSync(root, { recursive: true, force: true })
+  return { dirs, bytes }
+}
 /** 初始化：生成设备身份与同步目录。 */
 export function init(home) {
   const existed = existsSync(join(home, '.device-id'))

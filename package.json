@@ -1,7 +1,7 @@
 {
   "name": "dsh-cross-device-sync",
   "version": "0.1.0",
-  "description": "DSH 跨设备同步：配置走 git、会话日志走文件同步；带台账冲突检测、zstd 分帧完整性校验、自动触发与设备面板。",
+  "description": "DSH 跨设备同步：$DSH_HOME 单仓走 git（配置与会话同仓，远端建议 deepseek-harness-sessions）；带台账冲突检测、zstd 分帧完整性校验、敏感文件硬闸门、自动触发与设备面板。",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
@@ -42,7 +42,8 @@
     "status": "node bin/dsh-sync.mjs status",
     "verify": "node bin/dsh-sync.mjs verify",
     "sync": "node bin/dsh-sync.mjs sync",
-    "smoke": "node tests/smoke.mjs && node tests/routes.mjs",
+    "smoke": "node tests/smoke.mjs && node tests/routes.mjs && node tests/guard.mjs",
+    "guard": "node tests/guard.mjs",
     "check": "node --check src/engine.js && node --check src/index.js && node --check src/routes.js && node --check bin/dsh-sync.mjs && node --check src/client/index.cjs && node --check lib/client.js"
   },
   "keywords": [

@@ -10,11 +10,11 @@
  *   dsh-sync sync              pull + push
  *   dsh-sync diagnose          排查「面板没数据」：挂载标记 / profile 注册 / 客户端产物 / 上次同步
  *
- * 退出码：0 正常 · 2 冲突 · 3 git 问题 · 4 完整性问题
+ * 退出码：0 正常 · 2 冲突 · 3 git 问题 · 4 完整性问题 · 5 安全闸门（敏感/机器本地文件进了 git）
  */
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { classify, deviceId, git, hasRemote, init, isRepo, preflight, pruneArchived, readMountMarker, resolveHome, status, sync, verifyAll, walkSessions, writeLedger } from '../src/engine.js'
+import { classify, deviceId, emptyTrash, escapedNeverSyncPaths, git, guardNeverSync, hasRemote, init, isRepo, preflight, pruneArchived, readMountMarker, resolveHome, status, sync, verifyAll, walkSessions, writeLedger } from '../src/engine.js'
 
 const HOME = resolveHome()
 const argv = process.argv.slice(2)
@@ -46,7 +46,8 @@ function cmdInit() {
     say('\n本目录还不是 git 仓库，启用配置同步：')
     say(`  git -C "${HOME}" init -b main`)
     say(`  git -C "${HOME}" add -A && git -C "${HOME}" commit -m "dsh config"`)
-    say(`  git -C "${HOME}" remote add origin <你的私有仓库>`)
+    say(`  git -C "${HOME}" remote add origin https://github.com/<你的账号>/deepseek-harness-sessions.git`)
+  say(paint.dim('  会话与配置同仓；敏感文件由受管 .gitignore 块自动排除'))
     say(`  git -C "${HOME}" push -u origin main`)
   }
 }
@@ -68,6 +69,8 @@ function cmdStatus() {
   }
   if (s.missing.length > 0) say(`\n${paint.yel('台账里有、本地还没有（同步未送达）：')} ${s.missing.length} 个文件`)
   if (s.git.repo) {
+    const escaped = escapedNeverSyncPaths(HOME)
+    if (escaped.length > 0) say(paint.red(`\n安全闸门：这些路径会被 git 捕获，push/sync 将拒绝：${escaped.join(', ')}`))
     say(`\n${paint.b('git')} 仓库就绪；未提交变更 ${s.git.dirty} 项；origin ${s.git.remote ? '已配置' : paint.yel('未配置')}`)
     if (s.git.unmerged.length > 0) say(paint.red(`  未解决的合并冲突：${s.git.unmerged.join(', ')}`))
   } else {
@@ -125,6 +128,11 @@ function cmdPush() {
   if (dryRun) {
     say(paint.dim('[dry-run] git add -A && git commit && git push'))
     return
+  }
+  try {
+    guardNeverSync(HOME)
+  } catch (error) {
+    die(5, `\n安全闸门：${error.message}`)
   }
   git(HOME, ['add', '-A'])
   const c = git(HOME, ['commit', '-m', `sync(${pre.device.slice(0, 8)}): ${new Date().toISOString()}`])
@@ -227,6 +235,11 @@ function cmdSync() {
     return
   }
   const pre = gate()
+  try {
+    guardNeverSync(HOME)
+  } catch (error) {
+    die(5, `\n安全闸门：${error.message}`)
+  }
   const result = sync(HOME)
   if (result.error !== null) die(result.preflight?.conflicts?.length ? 2 : 3, `同步失败：${result.error}`)
   say(paint.grn(`同步完成 pull=${result.pulled} commit=${result.committed} push=${result.pushed}（设备 ${pre.device}）`))
@@ -237,6 +250,11 @@ function cmdSync() {
  * 默认只列清单，`--apply` 才真的删（护栏：先看范围）。
  */
 function cmdPrune() {
+  if (argv.includes('--empty-trash')) {
+    const r = emptyTrash(HOME)
+    say(paint.grn(`回收站已清空：${r.dirs} 个目录 / ${mb(r.bytes)}`))
+    return
+  }
   const apply = argv.includes('--apply') && !dryRun
   const result = pruneArchived(HOME, { apply })
   say(`归档标记：${result.archived} 条（来自 storages/workspace.json）`)
@@ -247,6 +265,7 @@ function cmdPrune() {
   const bytes = result.targets.reduce((sum, t) => sum + t.bytes, 0)
   say(`本地命中 ${result.targets.length} 个目录，合计 ${(bytes / 1048576).toFixed(1)} MB：`)
   for (const t of result.targets) say(`  ${t.project}/${t.id}  ${t.files} 个文件 / ${(t.bytes / 1048576).toFixed(2)} MB`)
+  if (result.trash !== null) say(paint.dim(`已移入回收站（可恢复）：${result.trash}`))
   if (result.applied) say(paint.grn(`已删除 ${result.targets.length} 个目录。归档不参与同步，其他设备的台账不受影响。`))
   else say(paint.yel('以上只是清单。确认后加 --apply 才删除。'))
 }
