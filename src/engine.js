@@ -400,18 +400,29 @@ export function status(home) {
   }
 }
 
-/** 完整性 + 冲突闸门；任一不过就抛错，绝不自动合并。 */
+/** GitHub 的单文件硬上限是 100 MB；留出余量，超了就拒绝提交而不是让 push 失败。 */
+export const MAX_SESSION_FILE_BYTES = 90 * 1024 * 1024
+/** 仓库体积预警线：超过就提示压缩历史（GitHub 对 >1GB 的仓库会警告并变慢）。 */
+export const MAX_REPO_BYTES = 800 * 1024 * 1024
+
+/** 完整性 + 冲突 + 体积闸门；任一不过就抛错，绝不自动合并。 */
 export function preflight(home, { me } = {}) {
   const device = me ?? deviceId(home)
   const sessions = walkSessions(home)
   const integrity = []
+  let totalBytes = 0
+  const oversize = []
   for (const s of sessions) {
     const { problems } = verifySession(s)
     if (problems.length > 0) integrity.push({ id: s.id, project: s.project, problems })
+    for (const log of s.logs) {
+      totalBytes += log.bytes
+      if (log.bytes > MAX_SESSION_FILE_BYTES) oversize.push({ rel: log.rel, bytes: log.bytes })
+    }
   }
   const { rows, missing } = classify(home, sessions, device)
   const conflicts = rows.filter(r => r.verdict === 'conflict')
-  return { device, sessions, integrity, conflicts, missing }
+  return { device, sessions, integrity, conflicts, missing, oversize, totalBytes }
 }
 
 /** 一次同步：拉配置 → 校验 → 记台账 → 提交推送。任一步失败即停。 */
@@ -422,6 +433,9 @@ export function sync(home, { commit = true, push = true } = {}) {
     result.preflight = pre
     if (pre.integrity.length > 0) throw new Error(`${pre.integrity.length} 个会话日志未通过完整性校验`)
     if (pre.conflicts.length > 0) throw new Error(`${pre.conflicts.length} 个会话两端都改过，拒绝自动继续`)
+    if (pre.oversize.length > 0) {
+      throw new Error(`${pre.oversize.length} 个会话文件超过 90 MB（GitHub 单文件上限 100 MB）：${pre.oversize[0].rel}`)
+    }
     if (!isRepo(home)) throw new Error('配置目录不是 git 仓库')
     const pull = git(home, ['pull', '--ff-only'], { quiet: false })
     if (pull.status !== 0) throw new Error('git pull 失败（可能有分叉）——不要 force，先人工处理')

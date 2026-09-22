@@ -251,7 +251,49 @@ function cmdPrune() {
   else say(paint.yel('以上只是清单。确认后加 --apply 才删除。'))
 }
 
-const cmds = { init: cmdInit, status: cmdStatus, verify: cmdVerify, pull: cmdPull, push: cmdPush, sync: cmdSync, diagnose: cmdDiagnose, prune: cmdPrune }
+/**
+ * compact：把仓库历史压成单个快照。
+ * 会话日志是二进制（zstd），git 无法跨版本 delta，所以每次同步都会把变更文件整份存一层。
+ * 这里用 orphan 提交替换历史；代价是**另一台设备必须重新 clone 或 git reset --hard**。
+ */
+function cmdCompact() {
+  if (!isRepo(HOME)) die(3, '不是 git 仓库；见 init 输出。')
+  const pre = preflight(HOME)
+  const mb = n => `${(n / 1048576).toFixed(1)} MB`
+  say(`当前工作树：${pre.sessions.length} 个会话 / ${mb(pre.totalBytes)}（归档已排除）`)
+  const counts = git(HOME, ['count-objects', '-vH'], { quiet: true }).stdout ?? ''
+  for (const line of counts.split('\n')) if (line.startsWith('size-pack') || line.startsWith('count')) say(`  ${line.trim()}`)
+
+  if (!argv.includes('--yes')) {
+    say(paint.yel('\n压缩会把历史替换成单个快照提交并 force push；另一台设备随后必须重新 clone 或 `git reset --hard origin/main`。'))
+    say('确认后：dsh-sync compact --yes')
+    return
+  }
+  if (dryRun) {
+    say(paint.dim('[dry-run] checkout --orphan → add -A → commit → branch -M → push --force-with-lease'))
+    return
+  }
+
+  const branch = (git(HOME, ['rev-parse', '--abbrev-ref', 'HEAD'], { quiet: true }).stdout ?? '').trim() || 'main'
+  const orphan = `_snapshot-${Date.now()}`
+  const step = (args, label) => {
+    const r = git(HOME, args)
+    if (r.status !== 0) {
+      say(r.stdout ?? '')
+      say(r.stderr ?? '')
+      die(3, `compact 失败于：${label}`)
+    }
+  }
+  step(['checkout', '--orphan', orphan], 'checkout --orphan')
+  step(['add', '-A'], 'add -A')
+  step(['commit', '-m', `snapshot: ${new Date().toISOString()}（历史压缩）`], 'commit')
+  step(['branch', '-M', branch], `branch -M ${branch}`)
+  if (hasRemote(HOME)) step(['push', '--force-with-lease', 'origin', branch], 'push --force-with-lease')
+  say(paint.grn(`已压缩：${branch} 现在只有一个快照提交。`))
+  say(paint.yel('另一台设备：git fetch origin && git reset --hard origin/' + branch + '（或重新 clone）'))
+}
+
+const cmds = { init: cmdInit, status: cmdStatus, verify: cmdVerify, pull: cmdPull, push: cmdPush, sync: cmdSync, diagnose: cmdDiagnose, prune: cmdPrune, compact: cmdCompact }
 if (!(cmd in cmds)) die(1, `未知子命令：${cmd}\n可用：${Object.keys(cmds).join(', ')}`)
 say(paint.dim(`DSH_HOME=${HOME}${dryRun ? '  [dry-run]' : ''}`))
 cmds[cmd]()
