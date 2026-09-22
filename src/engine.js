@@ -427,7 +427,7 @@ export function preflight(home, { me } = {}) {
 
 /** 一次同步：拉配置 → 校验 → 记台账 → 提交推送。任一步失败即停。 */
 export function sync(home, { commit = true, push = true } = {}) {
-  const result = { pulled: false, pushed: false, committed: false, preflight: null, error: null }
+  const result = { pulled: false, pushed: false, committed: false, ignored: null, preflight: null, error: null }
   try {
     const pre = preflight(home)
     result.preflight = pre
@@ -440,6 +440,9 @@ export function sync(home, { commit = true, push = true } = {}) {
     const pull = git(home, ['pull', '--ff-only'], { quiet: false })
     if (pull.status !== 0) throw new Error('git pull 失败（可能有分叉）——不要 force，先人工处理')
     result.pulled = true
+    // pull 之后再改写 .gitignore：带着脏工作区 pull 会被 git 拒绝。
+    // 归档会话必须进 .gitignore，否则下面的 add -A 会把它们提交进仓库。
+    result.ignored = syncArchivedIgnores(home)
     writeLedger(home, pre.device, pre.sessions)
     if (!commit) return result
     git(home, ['add', '-A'])
@@ -537,28 +540,70 @@ export function sessionTranscript(home, rel, { messageLimit = 200, textLimit = 4
 }
 
 /**
- * 删除本地已归档的会话目录。归档不参与同步，所以删掉它们不影响任何设备的台账。
+ * 列出本地命中归档的会话目录（含体积），供 prune 与 .gitignore 受管区块共用。
+ * @param home - DSH_HOME
+ * @returns 归档会话目录，rel 为相对 HOME 的路径
+ */
+export function archivedSessionDirs(home) {
+  const archived = archivedSessionIds(home)
+  const root = join(home, 'sessions')
+  const out = []
+  if (!existsSync(root)) return out
+  for (const project of readdirSync(root, { withFileTypes: true })) {
+    if (!project.isDirectory()) continue
+    const projectDir = join(root, project.name)
+    for (const session of readdirSync(projectDir, { withFileTypes: true })) {
+      if (!session.isDirectory() || !archived.has(session.name)) continue
+      const dir = join(projectDir, session.name)
+      const files = readdirSync(dir)
+      out.push({
+        rel: `sessions/${project.name}/${session.name}`,
+        dir,
+        project: project.name,
+        id: session.name,
+        files: files.length,
+        bytes: files.reduce((sum, f) => sum + statSync(join(dir, f)).size, 0),
+      })
+    }
+  }
+  return out
+}
+
+const IGNORE_BEGIN = '# >>> dsh-sync 归档会话（自动生成，勿手改） >>>'
+const IGNORE_END = '# <<< dsh-sync 归档会话 <<<'
+
+/**
+ * 在 .gitignore 里维护受管区块，列出归档会话目录。
+ * 为什么必须这样做：归档排除只影响"我们遍历什么"，而 `git add -A` 看的是文件系统——
+ * 不写进 .gitignore，归档的会话照样会被提交进仓库（实测踩过一次：95 个文件里 38 个是归档）。
+ * @param home - DSH_HOME
+ * @returns 受管条目数与是否改动
+ */
+export function syncArchivedIgnores(home) {
+  const file = join(home, '.gitignore')
+  const dirs = archivedSessionDirs(home)
+  const block = dirs.length === 0 ? '' : [IGNORE_BEGIN, ...dirs.map(d => `${d.rel}/`), IGNORE_END, ''].join('\n')
+  const current = existsSync(file) ? readFileSync(file, 'utf8') : ''
+  const start = current.indexOf(IGNORE_BEGIN)
+  const end = current.indexOf(IGNORE_END)
+  const base = start >= 0 && end > start
+    ? current.slice(0, start) + current.slice(end + IGNORE_END.length + 1)
+    : current
+  const trimmed = base.replace(/\s*$/, '')
+  const next = block === '' ? `${trimmed}\n` : `${trimmed}\n\n${block}`
+  if (next === current) return { entries: dirs.length, changed: false, file }
+  writeFileSync(file, next)
+  return { entries: dirs.length, changed: true, file }
+}
+
+/**
+ * 删除本地已归档的会话目录。归档不进同步，删掉不影响任何设备的台账。
  * 默认只列不删（护栏：先看清单，再 --apply）。
  */
 export function pruneArchived(home, { apply = false } = {}) {
-  const archived = archivedSessionIds(home)
-  const root = join(home, 'sessions')
-  const targets = []
-  if (existsSync(root)) {
-    for (const project of readdirSync(root, { withFileTypes: true })) {
-      if (!project.isDirectory()) continue
-      const projectDir = join(root, project.name)
-      for (const session of readdirSync(projectDir, { withFileTypes: true })) {
-        if (!session.isDirectory() || !archived.has(session.name)) continue
-        const dir = join(projectDir, session.name)
-        const files = readdirSync(dir)
-        const bytes = files.reduce((sum, f) => sum + statSync(join(dir, f)).size, 0)
-        targets.push({ dir, project: project.name, id: session.name, files: files.length, bytes })
-      }
-    }
-  }
+  const targets = archivedSessionDirs(home)
   if (apply) for (const target of targets) rmSync(target.dir, { recursive: true, force: true })
-  return { archived: archived.size, targets, applied: apply }
+  return { archived: archivedSessionIds(home).size, targets, applied: apply }
 }
 
 /** 初始化：生成设备身份与同步目录。 */

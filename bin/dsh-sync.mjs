@@ -289,6 +289,9 @@ function cmdCompact() {
   step(['commit', '-m', `snapshot: ${new Date().toISOString()}（历史压缩）`], 'commit')
   step(['branch', '-M', branch], `branch -M ${branch}`)
   if (hasRemote(HOME)) step(['push', '--force-with-lease', 'origin', branch], 'push --force-with-lease')
+  // squash 之后旧提交变成不可达对象，必须 prune 才真正回收磁盘（实测 294MB → 97MB）
+  step(['reflog', 'expire', '--expire=now', '--all'], 'reflog expire')
+  step(['gc', '--prune=now', '--quiet'], 'gc --prune=now')
   say(paint.grn(`已压缩：${branch} 现在只有一个快照提交。`))
   say(paint.yel('另一台设备：git fetch origin && git reset --hard origin/' + branch + '（或重新 clone）'))
 }
