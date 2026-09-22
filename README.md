@@ -30,7 +30,7 @@ DSH 的跨设备同步插件：**配置走 git，会话历史走文件同步**�
 ## 安装
 
 ```powershell
-# 1) 生成本地客户端产物（零依赖，产物入库）
+# 1) 生成本地客户端产物（零依赖；lib/ 是构建产物，不入库，克隆后必须先建一次）
 node build/build-client.mjs
 
 # 2) 本地开发（不发布也能装）
@@ -39,6 +39,8 @@ dsh plugin --profile web add link:D:\Desktop\dsh-cross-device-sync
 # 发布后
 dsh plugin --profile web add dsh-cross-device-sync
 ```
+
+`prepublishOnly` 会在 `npm publish` 前自动重建客户端产物，所以发布出去的包一定带 `lib/client.js`。
 
 `cordis.patch.yml` 负责把插件行插进 profile 的清单，装完重启 profile 生效；改客户端代码后要重新 `build:client` 并刷新页面（Vite 不参与动态插件产物）。
 

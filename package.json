@@ -38,6 +38,7 @@
   },
   "scripts": {
     "build:client": "node build/build-client.mjs",
+    "prepublishOnly": "node build/build-client.mjs",
     "status": "node bin/dsh-sync.mjs status",
     "verify": "node bin/dsh-sync.mjs verify",
     "sync": "node bin/dsh-sync.mjs sync",
