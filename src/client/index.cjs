@@ -13,12 +13,28 @@ const PANEL_ID = 'cross-device-sync'
 const BASE = '/cross-device-sync'
 
 async function request(path, init) {
-  const res = await fetch(`${BASE}${path}`, init)
+  let res
+  try {
+    res = await fetch(`${BASE}${path}`, init)
+  } catch (err) {
+    return { ok: false, error: `取不到 ${BASE}${path}：${err instanceof Error ? err.message : String(err)}` }
+  }
+  const type = res.headers.get('content-type') || ''
   const text = await res.text()
+  // Host 半边没挂载时请求会落到 SPA fallback，拿回一段 HTML——必须与真正的接口错误区分开，
+  // 否则用户只看到「毫无反应」。
+  if (!type.includes('json')) {
+    return {
+      ok: false,
+      error: res.status === 404
+        ? 'Host 半边未挂载：插件行只在 profile 启动时组合，请重启 web profile'
+        : `Host 半边未就绪（HTTP ${res.status}，content-type=${type || '空'}）——重启 web profile 后重试`,
+    }
+  }
   try {
     return JSON.parse(text)
   } catch {
-    return { ok: false, error: `响应不是 JSON（HTTP ${res.status}）` }
+    return { ok: false, error: `响应不是合法 JSON（HTTP ${res.status}）` }
   }
 }
 
@@ -48,6 +64,11 @@ const dim = { opacity: 0.6 }
 function DeviceSection(props) {
   const { status, selected, onSelect } = props
   const devices = status && status.devices ? status.devices : []
+  const label = device => {
+    if (device === 'all') return '全部设备'
+    const found = devices.find(d => d.device === device)
+    return `${found && found.self ? '本机 · ' : ''}${String(device).slice(0, 8)}${found ? ` (${found.files})` : ''}`
+  }
   return h(
     'div',
     { style: { display: 'flex', flexWrap: 'wrap', gap: '6px', margin: '8px 0' } },
@@ -57,6 +78,7 @@ function DeviceSection(props) {
         {
           key: id,
           type: 'button',
+          title: id === 'all' ? '不筛选' : id,
           onClick: () => onSelect(id),
           style: {
             padding: '2px 10px',
@@ -69,7 +91,7 @@ function DeviceSection(props) {
             opacity: selected === id ? 1 : 0.55,
           },
         },
-        id === 'all' ? '全部设备' : id.slice(0, 8),
+        label(id),
       ),
     ),
   )

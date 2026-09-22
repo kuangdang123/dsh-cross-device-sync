@@ -293,6 +293,18 @@ export function unmerged(home) {
 }
 
 // ── 对外动作 ────────────────────────────────────────────────────────────────
+/** 台账里的设备清单：UI 的「设备筛选」用它，本机永远在列（即使还没写过台账）。 */
+export function devicesFromLedgers(home, me) {
+  const map = new Map()
+  for (const ledger of allLedgers(home)) {
+    const files = Object.keys(ledger.files ?? {}).length
+    const bytes = Object.values(ledger.files ?? {}).reduce((sum, f) => sum + (typeof f?.bytes === 'number' ? f.bytes : 0), 0)
+    map.set(ledger.device, { device: ledger.device, files, bytes, updatedAt: ledger.updatedAt ?? null, self: ledger.device === me })
+  }
+  if (!map.has(me)) map.set(me, { device: me, files: 0, bytes: 0, updatedAt: null, self: true })
+  return [...map.values()].sort((a, b) => (a.self === b.self ? String(a.device).localeCompare(String(b.device)) : a.self ? -1 : 1))
+}
+
 export function status(home) {
   const me = deviceId(home)
   const sessions = walkSessions(home)
@@ -303,6 +315,7 @@ export function status(home) {
   }, {})
   return {
     device: me,
+    devices: devicesFromLedgers(home, me),
     sessions: sessions.length,
     files: rows.length,
     bytes: rows.reduce((a, r) => a + r.bytes, 0),
