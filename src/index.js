@@ -8,7 +8,7 @@
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { deviceId, preflight, resolveHome, status as engineStatus, sessionSummaries, sync, writeLedger, writeMountMarker, git, isRepo, hasRemote } from './engine.js'
+import { deviceId, preflight, resolveHome, status as engineStatus, sessionSummaries, sessionTranscript, sync, writeLedger, writeMountMarker, git, isRepo, hasRemote } from './engine.js'
 import { registerRoutes } from './routes.js'
 
 export const name = 'cross-device-sync'
@@ -179,6 +179,8 @@ export function apply(ctx, rowConfig = {}) {
     device,
     status: () => engineStatus(home),
     sessions: () => sessionSummaries(home),
+    /** 只读转写：面板点开某条会话时用，绝不写回原文件。 */
+    transcript: rel => sessionTranscript(home, rel),
     preflight: () => preflight(home),
     repo: () => ({ isRepo: isRepo(home), hasRemote: hasRemote(home) }),
     ledger: () => writeLedger(home, device, preflight(home).sessions),

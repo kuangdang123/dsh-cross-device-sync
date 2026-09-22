@@ -6,7 +6,7 @@
  *   - resume 使用日志里记录的 cwd 且不做校验，所以路径靠 devices.yaml 对齐；
  *   - 顺序使用下没有跨机并发写，真正的风险是「未同步窗口」——由台账检出。
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, openSync, readSync, closeSync } from 'node:fs'
 import { join, relative, sep } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 import { spawnSync } from 'node:child_process'
@@ -63,15 +63,41 @@ export function deviceId(home, { create = false } = {}) {
 }
 
 // ── 会话文件 ────────────────────────────────────────────────────────────────
-export function walkSessions(home) {
+/**
+ * 归档会话：读取 `storages/workspace.json` 的 `global.archivedSessionIds`。
+ * 规则：归档的东西不参与同步（不进台账、不进面板列表），可以用 `prune` 从本地删掉。
+ * @param home - DSH_HOME
+ * @returns 归档会话 id 的集合（与 sessions/ 下的目录名同形）
+ */
+export function archivedSessionIds(home) {
+  const file = join(home, 'storages', 'workspace.json')
+  if (!existsSync(file)) return new Set()
+  try {
+    const data = JSON.parse(readFileSync(file, 'utf8'))
+    const ids = data?.global?.archivedSessionIds
+    return new Set(Array.isArray(ids) ? ids.map(String) : [])
+  } catch {
+    // 工作区清单损坏时按"没有归档"处理：宁可多同步，不可误删。
+    return new Set()
+  }
+}
+
+/**
+ * 遍历本地会话日志。
+ * @param home - DSH_HOME
+ * @param options.includeArchived - 默认 false：归档会话被排除在同步与列表之外
+ */
+export function walkSessions(home, { includeArchived = false } = {}) {
   const root = join(home, 'sessions')
   const out = []
   if (!existsSync(root)) return out
+  const archived = includeArchived ? new Set() : archivedSessionIds(home)
   for (const project of readdirSync(root, { withFileTypes: true })) {
     if (!project.isDirectory()) continue
     const projectDir = join(root, project.name)
     for (const session of readdirSync(projectDir, { withFileTypes: true })) {
       if (!session.isDirectory()) continue
+      if (archived.has(session.name)) continue
       const dir = join(projectDir, session.name)
       const logs = readdirSync(dir).filter(n => LOG_RE.test(n)).sort()
       if (logs.length === 0) continue
@@ -204,6 +230,7 @@ export function verifyAll(home, { full = false } = {}) {
  * device 来自台账：写明这个文件最近由哪台设备改动过。
  */
 export function sessionSummaries(home) {
+  const me = deviceId(home)
   const ledgers = allLedgers(home)
   const owner = new Map()
   for (const ledger of ledgers) {
@@ -229,7 +256,9 @@ export function sessionSummaries(home) {
         cwd: header?.cwd ?? null,
         createdAt: header?.createdAt ?? null,
         preset: header?.agentPreset ?? null,
-        device: owner.get(log.rel) ?? null,
+        // 没有台账归属的文件一定是本机产物（拉来的会话会被对方台账标上设备），
+        // 默认记为本机——否则面板按设备筛选时会把自己刚写的东西全滤掉。
+        device: owner.get(log.rel) ?? me,
       })
     }
   }
@@ -333,7 +362,14 @@ export function devicesFromLedgers(home, me) {
     const bytes = Object.values(ledger.files ?? {}).reduce((sum, f) => sum + (typeof f?.bytes === 'number' ? f.bytes : 0), 0)
     map.set(ledger.device, { device: ledger.device, files, bytes, updatedAt: ledger.updatedAt ?? null, self: ledger.device === me })
   }
-  if (!map.has(me)) map.set(me, { device: me, files: 0, bytes: 0, updatedAt: null, self: true })
+  const self = walkSessions(home)
+  map.set(me, {
+    device: me,
+    files: self.reduce((n, s) => n + s.logs.length, 0),
+    bytes: self.reduce((n, s) => n + s.logs.reduce((b, l) => b + l.bytes, 0), 0),
+    updatedAt: map.get(me)?.updatedAt ?? null,
+    self: true,
+  })
   return [...map.values()].sort((a, b) => (a.self === b.self ? String(a.device).localeCompare(String(b.device)) : a.self ? -1 : 1))
 }
 
@@ -407,6 +443,108 @@ export function sync(home, { commit = true, push = true } = {}) {
     result.error = error instanceof Error ? error.message : String(error)
     return result
   }
+}
+
+/**
+ * 把一份会话日志投影成面板可读的只读转写。
+ * 只读：不写回原文件，也不改任何状态——跨设备看历史不该有副作用。
+ * @param home - DSH_HOME
+ * @param rel - 会话日志相对路径，必须是 walkSessions 列出的文件（白名单校验，杜绝路径穿越）
+ * @param options.messageLimit - 保留最后多少条消息
+ * @param options.textLimit - 单条消息截断长度
+ */
+export function sessionTranscript(home, rel, { messageLimit = 200, textLimit = 4000 } = {}) {
+  const target = walkSessions(home).flatMap(s => s.logs).find(l => l.rel === rel)
+  if (target === undefined) return { ok: false, error: '该会话不在本地可见集合里' }
+
+  let text
+  if (target.name.endsWith('.zstd')) {
+    const buf = readFileSync(target.abs)
+    const parts = []
+    let bad = 0
+    for (const off of frameOffsets(buf)) {
+      const decoded = decodeAt(buf, off)
+      if (decoded === undefined) bad += 1
+      else parts.push(decoded)
+    }
+    if (bad > 0) return { ok: false, error: `${bad} 帧解压失败，拒绝渲染不完整的会话` }
+    text = parts.join('')
+  } else {
+    text = readFileSync(target.abs, 'utf8')
+  }
+
+  const events = []
+  for (const line of text.split('\n')) {
+    if (line.trim().length === 0) continue
+    try {
+      events.push(JSON.parse(line))
+    } catch {
+      // 分帧日志理论上每行都是完整 JSON；容忍半行（截断尾部）而不放弃整份记录。
+    }
+  }
+
+  const clip = value => {
+    const str = String(value ?? '')
+    return str.length > textLimit ? `${str.slice(0, textLimit)}…（已截断）` : str
+  }
+  const textOf = content => (Array.isArray(content) ? content.filter(b => b?.type === 'text').map(b => b.text).join('\n') : '')
+  const header = events.find(e => e.type === 'session')
+  const messages = []
+  for (const event of events) {
+    const data = event.data ?? {}
+    if (event.type === 'user/message') {
+      const body = textOf(data.content)
+      if (body.trim().length === 0) continue
+      messages.push({ seq: event.seq, role: data.source?.kind === 'user' ? 'user' : 'context', text: clip(body) })
+    } else if (event.type === 'assistant/message') {
+      const body = textOf(data.message?.content)
+      if (body.trim().length === 0) continue
+      messages.push({ seq: event.seq, role: 'assistant', text: clip(body) })
+    } else if (event.type === 'tool/call') {
+      messages.push({ seq: event.seq, role: 'tool-call', text: clip(`${data.name}(${data.arguments ?? ''})`) })
+    } else if (event.type === 'tool/result') {
+      messages.push({ seq: event.seq, role: 'tool-result', text: clip(textOf(data.message?.content) || '(空结果)') })
+    }
+  }
+
+  const truncated = messages.length > messageLimit
+  return {
+    ok: true,
+    rel,
+    sessionId: header?.id ?? null,
+    cwd: header?.cwd ?? null,
+    createdAt: header?.createdAt ?? null,
+    preset: header?.agentPreset ?? null,
+    bytes: target.bytes,
+    messageCount: messages.length,
+    truncated,
+    messages: truncated ? messages.slice(-messageLimit) : messages,
+  }
+}
+
+/**
+ * 删除本地已归档的会话目录。归档不参与同步，所以删掉它们不影响任何设备的台账。
+ * 默认只列不删（护栏：先看清单，再 --apply）。
+ */
+export function pruneArchived(home, { apply = false } = {}) {
+  const archived = archivedSessionIds(home)
+  const root = join(home, 'sessions')
+  const targets = []
+  if (existsSync(root)) {
+    for (const project of readdirSync(root, { withFileTypes: true })) {
+      if (!project.isDirectory()) continue
+      const projectDir = join(root, project.name)
+      for (const session of readdirSync(projectDir, { withFileTypes: true })) {
+        if (!session.isDirectory() || !archived.has(session.name)) continue
+        const dir = join(projectDir, session.name)
+        const files = readdirSync(dir)
+        const bytes = files.reduce((sum, f) => sum + statSync(join(dir, f)).size, 0)
+        targets.push({ dir, project: project.name, id: session.name, files: files.length, bytes })
+      }
+    }
+  }
+  if (apply) for (const target of targets) rmSync(target.dir, { recursive: true, force: true })
+  return { archived: archived.size, targets, applied: apply }
 }
 
 /** 初始化：生成设备身份与同步目录。 */

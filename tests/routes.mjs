@@ -3,13 +3,26 @@
  * 再用假的 req/res 走一遍 GET /status、GET /sessions、POST /run 与信任围栏。
  * 全程在临时 DSH_HOME 里，不碰真实状态。
  */
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import assert from 'node:assert/strict'
 
 const home = mkdtempSync(join(tmpdir(), 'dsh-cross-device-sync-routes-'))
 process.env.DSH_HOME = home
+
+// 一份明文（compression: none）会话日志做夹具：不需要 zstd 就能走通转写投影。
+const fixtureDir = join(home, 'sessions', '--tmp--proj--', 'session-11111111-2222-3333-4444-555555555555')
+mkdirSync(fixtureDir, { recursive: true })
+writeFileSync(
+  join(fixtureDir, 'session.jsonl'),
+  [
+    JSON.stringify({ type: 'session', version: 0, id: 'session-11111111-2222-3333-4444-555555555555', createdAt: 1, cwd: 'D:\\tmp\\proj', agentPreset: 'ptc' }),
+    JSON.stringify({ type: 'user/message', seq: 1, time: 2, data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '你好' }] } }),
+    JSON.stringify({ type: 'tool/call', seq: 2, time: 3, data: { turn: 1, step: 1, callId: 'c1', name: 'pwsh', arguments: '{"command":"pwd"}' } }),
+    JSON.stringify({ type: 'assistant/message', seq: 3, time: 4, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '已在 D:\\tmp\\proj' }] } } }),
+  ].join('\n') + '\n',
+)
 
 const { apply } = await import('../src/index.js')
 
@@ -103,6 +116,25 @@ assert.match(run.json.error ?? '', /git 仓库/)
 
 const unknown = await call(fakeReq({ url: '/cross-device-sync/nope' }))
 assert.equal(unknown.status, 404)
+
+// 转写：只读投影，user/tool-call/assistant 都在
+const rel = 'sessions/--tmp--proj--/session-11111111-2222-3333-4444-555555555555/session.jsonl'
+const transcript = await call(fakeReq({ url: `/cross-device-sync/transcript?rel=${encodeURIComponent(rel)}` }))
+assert.equal(transcript.status, 200)
+assert.equal(transcript.json.sessionId, 'session-11111111-2222-3333-4444-555555555555')
+assert.equal(transcript.json.messageCount, 3, '应有 user / tool-call / assistant 三条')
+assert.deepEqual(transcript.json.messages.map(m => m.role), ['user', 'tool-call', 'assistant'])
+
+// 白名单：不在本地可见集合里的 rel（含路径穿越）一律 404，绝不按路径读盘
+const traversal = await call(fakeReq({ url: '/cross-device-sync/transcript?rel=../../.credentials.yaml' }))
+assert.equal(traversal.status, 404, '路径穿越必须被白名单挡掉')
+assert.match(traversal.json.error ?? '', /不在本地可见集合/)
+
+// 会话列表里应出现夹具，且未知归属默认记为本机（不是 null）
+const list = await call(fakeReq({ url: '/cross-device-sync/sessions' }))
+const fixture = list.json.sessions.find(s => s.id === 'session-11111111-2222-3333-4444-555555555555')
+assert.ok(fixture, 'sessions 应列出这条夹具')
+assert.equal(typeof fixture.device, 'string', '没有台账归属时应默认记为本机，而不是 null')
 
 for (const dispose of effects) if (typeof dispose === 'function') dispose()
 rmSync(home, { recursive: true, force: true })

@@ -83,6 +83,12 @@ export function registerRoutes(webServer, api) {
         sendJson(res, 200, { ok: true, ...api.sessions() })
         return
       }
+      if (req.method === 'GET' && route === '/transcript') {
+        // rel 由 api.transcript 对白名单校验（只认本地可见的会话文件），没有路径穿越面。
+        const result = api.transcript(url.searchParams.get('rel') ?? '')
+        sendJson(res, result.ok ? 200 : 404, result)
+        return
+      }
       if (req.method === 'POST' && route === '/run') {
         await readBody(req)
         const result = api.runSync()

@@ -108,14 +108,84 @@ function SessionList(props) {
     null,
     rows.slice(0, 300).map(s =>
       h(
-        'div',
-        { key: s.rel, style: rowStyle },
+        'button',
+        {
+          key: s.rel,
+          type: 'button',
+          onClick: () => props.onOpen(s.rel),
+          title: '只读打开这条会话（不会改动原文件）',
+          style: { ...rowStyle, display: 'flex', width: '100%', textAlign: 'left', background: 'transparent', color: 'inherit', border: 'none', borderBottom: '1px solid currentColor', cursor: 'pointer', font: 'inherit' },
+        },
         h('span', { style: { minWidth: '160px', ...dim } }, s.project.replace(/^-+|-+$/g, '') || 'root'),
         h('span', { style: { fontFamily: 'ui-monospace, monospace' } }, s.id.slice(0, 20)),
         h('span', { style: dim }, s.cwd || '(无 cwd)'),
         h('span', { style: { marginLeft: 'auto', ...dim } }, s.device ? s.device.slice(0, 8) : '—', ' · ', fmtMB(s.bytes)),
       ),
     ),
+  )
+}
+
+/** 只读转写视图：把某个会话日志投影成消息流。绝不写回原文件。 */
+function Transcript(props) {
+  const [data, setData] = React.useState(null)
+  const [error, setError] = React.useState(null)
+
+  React.useEffect(() => {
+    let alive = true
+    request(`/transcript?rel=${encodeURIComponent(props.rel)}`).then(result => {
+      if (!alive) return
+      if (result.ok === false) setError(result.error || '读取失败')
+      else setData(result)
+    })
+    return () => {
+      alive = false
+    }
+  }, [props.rel])
+
+  const roleStyle = role => ({
+    user: { fontWeight: 600 },
+    assistant: {},
+    context: { opacity: 0.7 },
+    'tool-call': { opacity: 0.75, fontFamily: 'ui-monospace, monospace', fontSize: '11px' },
+    'tool-result': { opacity: 0.55, fontFamily: 'ui-monospace, monospace', fontSize: '11px' },
+  }[role] ?? {})
+
+  return h(
+    'div',
+    null,
+    h(
+      'button',
+      {
+        type: 'button',
+        onClick: props.onClose,
+        style: { padding: '3px 12px', fontSize: '12px', cursor: 'pointer', background: 'transparent', color: 'inherit', border: '1px solid currentColor', borderRadius: '6px' },
+      },
+      '← 返回会话列表',
+    ),
+    error ? h('div', { style: { fontSize: '12px', margin: '8px 0' } }, `⚠ ${error}`) : null,
+    data
+      ? h(
+          'div',
+          null,
+          h(
+            'div',
+            { style: { ...dim, fontSize: '11px', margin: '8px 0', fontFamily: 'ui-monospace, monospace' } },
+            `${data.sessionId ?? props.rel} · cwd=${data.cwd ?? '-'} · ${data.messageCount} 条消息${data.truncated ? '（只显示最后若干条）' : ''} · 只读`,
+          ),
+          h(
+            'div',
+            { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+            data.messages.map((m, i) =>
+              h(
+                'div',
+                { key: `${m.seq}-${i}`, style: { fontSize: '12px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', borderLeft: '2px solid currentColor', paddingLeft: '8px', opacity: 0.95 } },
+                h('div', { style: { ...dim, fontSize: '10px' } }, `#${m.seq} ${m.role}`),
+                h('div', { style: roleStyle(m.role) }, m.text),
+              ),
+            ),
+          ),
+        )
+      : h('div', { style: { ...dim, fontSize: '12px', margin: '8px 0' } }, '读取中…'),
   )
 }
 
@@ -126,6 +196,7 @@ function Panel() {
   const [diag, setDiag] = React.useState(null)
   const [selected, setSelected] = React.useState('all')
   const [busy, setBusy] = React.useState(false)
+  const [openRel, setOpenRel] = React.useState(null)
 
   const refresh = React.useCallback(async () => {
     try {
@@ -164,6 +235,16 @@ function Panel() {
 
   const rows = selected === 'all' ? sessions : sessions.filter(s => s.device === selected)
   const conflicts = status && status.conflicts ? status.conflicts.length : 0
+
+  // 打开某条会话时切到只读转写视图：跨设备看历史，不触碰原文件、也不切换当前会话。
+  if (openRel !== null) {
+    return h(
+      'div',
+      { style: { padding: '16px 20px', fontSize: '13px', overflowY: 'auto', height: '100%' } },
+      h('h2', { style: { margin: '0 0 8px', fontSize: '15px' } }, '设备同步 · 只读历史'),
+      h(Transcript, { rel: openRel, onClose: () => setOpenRel(null) }),
+    )
+  }
 
   return h(
     'div',
@@ -223,7 +304,7 @@ function Panel() {
     status && status.sessions
       ? h('div', { style: { ...dim, fontSize: '12px', marginBottom: '4px' } }, `本地可见 ${rows.length} 个会话日志`)
       : null,
-    h(SessionList, { rows }),
+    h(SessionList, { rows, onOpen: setOpenRel }),
     sessions.length > 0
       ? h(
           'div',

@@ -14,7 +14,7 @@
  */
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { classify, deviceId, git, hasRemote, init, isRepo, preflight, readMountMarker, resolveHome, status, sync, verifyAll, walkSessions, writeLedger } from '../src/engine.js'
+import { classify, deviceId, git, hasRemote, init, isRepo, preflight, pruneArchived, readMountMarker, resolveHome, status, sync, verifyAll, walkSessions, writeLedger } from '../src/engine.js'
 
 const HOME = resolveHome()
 const argv = process.argv.slice(2)
@@ -232,7 +232,26 @@ function cmdSync() {
   say(paint.grn(`同步完成 pull=${result.pulled} commit=${result.committed} push=${result.pushed}（设备 ${pre.device}）`))
 }
 
-const cmds = { init: cmdInit, status: cmdStatus, verify: cmdVerify, pull: cmdPull, push: cmdPush, sync: cmdSync, diagnose: cmdDiagnose }
+/**
+ * prune：归档会话不参与同步，所以可以安全地从本地删掉。
+ * 默认只列清单，`--apply` 才真的删（护栏：先看范围）。
+ */
+function cmdPrune() {
+  const apply = argv.includes('--apply') && !dryRun
+  const result = pruneArchived(HOME, { apply })
+  say(`归档标记：${result.archived} 条（来自 storages/workspace.json）`)
+  if (result.targets.length === 0) {
+    say(paint.dim('本地没有命中归档的会话目录，无需清理。'))
+    return
+  }
+  const bytes = result.targets.reduce((sum, t) => sum + t.bytes, 0)
+  say(`本地命中 ${result.targets.length} 个目录，合计 ${(bytes / 1048576).toFixed(1)} MB：`)
+  for (const t of result.targets) say(`  ${t.project}/${t.id}  ${t.files} 个文件 / ${(t.bytes / 1048576).toFixed(2)} MB`)
+  if (result.applied) say(paint.grn(`已删除 ${result.targets.length} 个目录。归档不参与同步，其他设备的台账不受影响。`))
+  else say(paint.yel('以上只是清单。确认后加 --apply 才删除。'))
+}
+
+const cmds = { init: cmdInit, status: cmdStatus, verify: cmdVerify, pull: cmdPull, push: cmdPush, sync: cmdSync, diagnose: cmdDiagnose, prune: cmdPrune }
 if (!(cmd in cmds)) die(1, `未知子命令：${cmd}\n可用：${Object.keys(cmds).join(', ')}`)
 say(paint.dim(`DSH_HOME=${HOME}${dryRun ? '  [dry-run]' : ''}`))
 cmds[cmd]()
