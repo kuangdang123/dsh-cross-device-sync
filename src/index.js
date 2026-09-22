@@ -8,7 +8,8 @@
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { deviceId, preflight, resolveHome, status as engineStatus, sync, writeLedger, git, isRepo, hasRemote } from './engine.js'
+import { deviceId, preflight, resolveHome, status as engineStatus, sessionSummaries, sync, writeLedger, git, isRepo, hasRemote } from './engine.js'
+import { registerRoutes } from './routes.js'
 
 export const name = 'cross-device-sync'
 export const inject = []
@@ -171,19 +172,42 @@ export function apply(ctx, rowConfig = {}) {
     log.warn?.(`cross-device-sync: 挂载盘点失败：${error}`)
   }
 
-  // 供将来的 Client 半边与 CLI 复用的宿主侧入口（包内私有，不注册公共服务）。
-  ctx.effect(
-    () => () => {},
-    'cross-device-sync placeholder',
-  )
-
-  return {
+  const api = {
     device,
     status: () => engineStatus(home),
+    sessions: () => sessionSummaries(home),
     preflight: () => preflight(home),
+    repo: () => ({ isRepo: isRepo(home), hasRemote: hasRemote(home) }),
     ledger: () => writeLedger(home, device, preflight(home).sessions),
     pull: () => git(home, ['pull', '--ff-only'], { quiet: false }),
-    repo: () => ({ isRepo: isRepo(home), hasRemote: hasRemote(home) }),
     trigger: schedule,
+    /** UI 面板的「立即同步」：同步并刷新状态文件。 */
+    runSync: () => {
+      const result = sync(home)
+      const pre = result.preflight
+      writeStatus({
+        reason: 'manual',
+        ok: result.error === null,
+        error: result.error,
+        pulled: result.pulled,
+        committed: result.committed,
+        pushed: result.pushed,
+        conflicts: pre?.conflicts?.map(c => c.rel) ?? [],
+        integrityProblems: pre?.integrity?.length ?? 0,
+        pendingRemote: pre?.missing?.length ?? 0,
+      })
+      return result
+    },
   }
+
+  // Client 半边通过这里取数；没有 webServer 时插件仍然工作（只是面板读不到数据）。
+  const webServer = ctx.get('webServer')
+  if (webServer !== undefined) {
+    ctx.effect(() => registerRoutes(webServer, api), 'cross-device-sync: http routes')
+    log.info?.('cross-device-sync: HTTP 路由已挂载（/cross-device-sync/status|sessions|run）')
+  } else {
+    log.warn?.('cross-device-sync: 未找到 webServer，UI 面板将读不到数据')
+  }
+
+  return api
 }

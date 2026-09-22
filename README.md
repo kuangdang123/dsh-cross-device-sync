@@ -16,22 +16,31 @@ DSH 的跨设备同步插件：**配置走 git，会话历史走文件同步**�
 
 | 半边 | 入口 | 运行位置 | 职责 |
 | --- | --- | --- | --- |
-| Host | `src/index.js`（`main`） | DSH 的 Node 进程 | 同步引擎、git 操作、台账、完整性校验、事件与定时触发 |
-| Client | 待实现（`./client` + `dsh.client`） | 浏览器 | `sidebar.panellist` 入口图标 + `main` 设备面板 + 设置页 |
+| Host | `src/index.js`（`main`） | DSH 的 Node 进程 | 同步引擎、git 操作、台账、完整性校验、事件与定时触发、HTTP 路由 |
+| Client | `lib/client.js`（`./client`） | 浏览器 | `sidebar.panellist` 入口图标 + `main` 设备面板（设备筛选、会话列表、手动同步） |
 
-两者通过包内私有 RPC 通信（Host `harness.handle` / Client `host.call`），不新开公共服务。
+两边的唯一通道是本包自己的 HTTP 路由 `/cross-device-sync/{status,sessions,run}`，只接受 **loopback 套接字 + loopback Host 头**（与 `dsh-ssh` / git-graph 同一套信任围栏），不新开 Cordis 公共服务。
+
+### 客户端产物
+
+`lib/client.js` 是官方约定的闭包工厂：以 `window.__ModuleLoader__.load({ id, factory })` 开头，`factory` 收到同步的 `require`（模块表），只能取平台基线 `react`、`react/jsx-runtime`、`react-dom`、`react-dom/client`、`@deepseek-ai/cordis`、`@deepseek-ai/dsh-client-store`、`@deepseek-ai/dsh-client-ui-slots`、`@deepseek-ai/dsh-client-ui-primitives`、`@deepseek-ai/dsh-client-ui-dockkit`。
+
+客户端半边是 CommonJS 源码 `src/client/index.cjs`（只用 React，无 CSS Modules），由**零依赖**的 `build/build-client.mjs` 包一层生成产物——不需要 tsdown / lightningcss / monorepo 构建预设。将来要写 TSX 或 CSS Modules 时，改为复制官方预设 `packages/client/tsdown.client.ts` + `build/web/src/platform.ts` 并保持同步。
 
 ## 安装
 
 ```powershell
-# 本地开发（不发布也能装）
+# 1) 生成本地客户端产物（零依赖，产物入库）
+node build/build-client.mjs
+
+# 2) 本地开发（不发布也能装）
 dsh plugin --profile web add link:D:\Desktop\dsh-cross-device-sync
 
 # 发布后
 dsh plugin --profile web add dsh-cross-device-sync
 ```
 
-`cordis.patch.yml` 负责把插件行插进 profile 的清单，装完重启 profile 生效。
+`cordis.patch.yml` 负责把插件行插进 profile 的清单，装完重启 profile 生效；改客户端代码后要重新 `build:client` 并刷新页面（Vite 不参与动态插件产物）。
 
 ## 使用
 
@@ -81,10 +90,12 @@ node bin/dsh-sync.mjs sync            # pull + push
 
 - [x] Host 半边：同步引擎、台账、完整性校验、三个触发点、状态文件
 - [x] CLI（与 Host 共用 `src/engine.js`，行为一致）
-- [ ] Client 半边：`sidebar.panellist` 图标 + `main` 设备面板（设备列表、远端会话只读浏览、同步状态与手动触发）
-- [ ] 类型化构建：TS 源码 + `tsc`/`tsdown`，`Config` 用 schemastery 校验，`main` 切到 `lib/`
+- [x] Host HTTP 路由：`/status`、`/sessions`、`/run`（loopback 围栏 + 冒烟测试）
+- [x] Client 半边：`sidebar.panellist` 图标 + `main` 设备面板（设备筛选、会话列表、手动同步）
+- [ ] 类型化构建：TS/TSX 源码 + 官方 tsdown 预设，`Config` 用 schemastery 校验，`main` 切到 `lib/`
 - [ ] 跨设备继续会话：合并 `workspace.json`（按设备重写 path）、路径映射生效、非本机会话默认只读 / 可 fork
 - [ ] 设置页：git 账号与 token 走 `ctx.credentials`，同步策略在 UI 里配
+- [ ] i18n：面板文案走 `ctx.locale` 字典（现在是内联中文）
 
 ## 明确不做
 
@@ -95,8 +106,9 @@ node bin/dsh-sync.mjs sync            # pull + push
 
 ## 已知边界
 
-- 同步来的会话**不会自动出现在 GUI 侧栏**：那个列表来自 persistence 后端（单一必填 `root`）。阶段 2 用自己的面板绕过；阶段 4 才可能做成原生可见。
-- 本插件目前是**纯 JS、零外部依赖**（只用 `node:*`），所以拷过去就能跑；代价是插件行 config 没有 schemastery 校验（阶段 3 补）。
+- 同步来的会话**不会自动出现在 GUI 侧栏**：那个列表来自 persistence 后端（单一必填 `root`）。本插件的 `设备同步` 面板能列出并筛选它们（数据来自 `/sessions` 路由），但"像本地会话一样点开继续"要等路线图第 6 项。
+- 面板列的是**本地可见**的会话文件：另一台设备的会话必须已经同步到位才会出现；面板里的设备筛选按台账归属区分。
+- 本插件目前是**纯 JS、零外部依赖**（Host 只用 `node:*`，Client 只用模块表里的 `react`），所以拷过去就能跑；代价是插件行 config 没有 schemastery 校验、面板文案没有走 i18n（都在路线图里）。
 
 ## 许可
 

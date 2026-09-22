@@ -166,6 +166,45 @@ export function verifyAll(home, { full = false } = {}) {
   return { total: sessions.length, failed: results.filter(r => r.problems.length > 0).length, results }
 }
 
+/**
+ * 每个会话日志一行的摘要，供 UI 面板列出「本地可见的全部会话」。
+ * 只解首帧（session 头）拿 cwd / createdAt / preset，不解全文件。
+ * device 来自台账：写明这个文件最近由哪台设备改动过。
+ */
+export function sessionSummaries(home) {
+  const ledgers = allLedgers(home)
+  const owner = new Map()
+  for (const ledger of ledgers) {
+    for (const rel of Object.keys(ledger.files ?? {})) owner.set(rel, ledger.device)
+  }
+  const rows = []
+  for (const session of walkSessions(home)) {
+    for (const log of session.logs) {
+      let header
+      try {
+        const text = decodeAt(readSlice(log.abs, 0, 1024 * 1024), 0)
+        header = text === undefined ? undefined : JSON.parse(text.split('\n').find(l => l.trim().length > 0) ?? '{}')
+      } catch {
+        header = undefined
+      }
+      rows.push({
+        rel: log.rel,
+        project: session.project,
+        id: session.id,
+        generation: log.name,
+        bytes: log.bytes,
+        mtimeMs: log.mtimeMs,
+        cwd: header?.cwd ?? null,
+        createdAt: header?.createdAt ?? null,
+        preset: header?.agentPreset ?? null,
+        device: owner.get(log.rel) ?? null,
+      })
+    }
+  }
+  rows.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return { sessions: rows }
+}
+
 // ── 同步台账 ────────────────────────────────────────────────────────────────
 const ledgerDir = home => join(home, '.dsh-sync')
 const ledgerPath = (home, id) => join(ledgerDir(home), `ledger-${id}.json`)

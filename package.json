@@ -1,12 +1,13 @@
 {
   "name": "dsh-cross-device-sync",
   "version": "0.1.0",
-  "description": "DSH 跨设备同步：配置走 git、会话日志走文件同步；带台账冲突检测、zstd 分帧完整性校验与自动触发。",
+  "description": "DSH 跨设备同步：配置走 git、会话日志走文件同步；带台账冲突检测、zstd 分帧完整性校验、自动触发与设备面板。",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
     ".": "./src/index.js",
     "./engine": "./src/engine.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
   "dsh": {
@@ -15,11 +16,19 @@
     },
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
     }
   },
   "files": [
     "src",
+    "build",
     "bin",
+    "lib",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -28,11 +37,12 @@
     "node": "^22.19 || >=24"
   },
   "scripts": {
+    "build:client": "node build/build-client.mjs",
     "status": "node bin/dsh-sync.mjs status",
     "verify": "node bin/dsh-sync.mjs verify",
     "sync": "node bin/dsh-sync.mjs sync",
-    "smoke": "node tests/smoke.mjs",
-    "check": "node --check src/engine.js && node --check src/index.js && node --check bin/dsh-sync.mjs"
+    "smoke": "node tests/smoke.mjs && node tests/routes.mjs",
+    "check": "node --check src/engine.js && node --check src/index.js && node --check src/routes.js && node --check bin/dsh-sync.mjs && node --check src/client/index.cjs && node --check lib/client.js"
   },
   "keywords": [
     "dsh",
@@ -45,5 +55,8 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/<你的账号>/dsh-cross-device-sync.git"
+  },
+  "peerDependencies": {
+    "react": "^18.2.0"
   }
 }
