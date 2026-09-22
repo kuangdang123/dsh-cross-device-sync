@@ -1,0 +1,9 @@
+# 这个文件是 profile bundle 的 patch 层：把本插件的行插进 web profile 的插件清单。
+#
+# 本地开发时直接装这个目录：
+#   dsh plugin --profile web add link:D:\Desktop\dsh-cross-device-sync
+# 发布到 npm 之后：
+#   dsh plugin --profile web add dsh-cross-device-sync
+- insert:
+    - id: cross-device-sync
+      name: dsh-cross-device-sync

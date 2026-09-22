@@ -1,0 +1,13 @@
+node_modules/
+lib/
+*.log
+
+# 本机同步状态（每个 $DSH_HOME 自己维护，绝不进仓库）
+.dsh-sync/
+.device-id
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
