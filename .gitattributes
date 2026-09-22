@@ -1,0 +1,6 @@
+# 统一用 LF：跨设备同步的仓库里不要混 CRLF
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.zstd binary
+*.ttf binary
