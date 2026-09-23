@@ -231,11 +231,12 @@ export function verifyAll(home, { full = false } = {}) {
  */
 export function sessionSummaries(home) {
   const me = deviceId(home)
+  const self = shortDevice(me)
   const ledgers = allLedgers(home)
   const attribution = gitAttribution(home)
   const owner = new Map()
   for (const ledger of ledgers) {
-    for (const rel of Object.keys(ledger.files ?? {})) owner.set(rel, ledger.device)
+    for (const rel of Object.keys(ledger.files ?? {})) owner.set(rel, shortDevice(ledger.device))
   }
   const rows = []
   for (const session of walkSessions(home)) {
@@ -259,7 +260,7 @@ export function sessionSummaries(home) {
         preset: header?.agentPreset ?? null,
         // 归属优先级：git 提交作者（随仓库旅行、最可信）→ 本机台账 → 本机。
         // 拉来的会话若没有 git 归属，才会落到"本机"这个兜底上。
-        device: attribution.get(log.rel)?.device ?? owner.get(log.rel) ?? me,
+        device: attribution.get(log.rel)?.device ?? owner.get(log.rel) ?? self,
         updatedAt: attribution.get(log.rel)?.at ?? log.mtimeMs,
       })
     }
@@ -307,6 +308,12 @@ export function writeLedger(home, id, sessions) {
 }
 
 const same = (a, b) => a !== undefined && b !== undefined && a.bytes === b.bytes && a.mtimeMs === b.mtimeMs
+
+/**
+ * 设备短标识（8 位）。台账里是完整 UUID，git 提交作者是 `dsh-<8位>`，
+ * 两者必须归一化到同一个键，否则同一台机器会在设备列表里出现两次。
+ */
+export const shortDevice = value => String(value ?? '').replace(/^dsh-/, '').slice(0, 8)
 
 /**
  * 活跃会话的提交冷却（分钟）。
@@ -499,14 +506,16 @@ export function guardNeverSync(home) {
 export function devicesFromLedgers(home, me) {
   const map = new Map()
   const attribution = gitAttribution(home)
+  const selfId = shortDevice(me)
   for (const ledger of allLedgers(home)) {
+    const key = shortDevice(ledger.device)
     const files = Object.keys(ledger.files ?? {}).length
     const bytes = Object.values(ledger.files ?? {}).reduce((sum, f) => sum + (typeof f?.bytes === 'number' ? f.bytes : 0), 0)
-    map.set(ledger.device, { device: ledger.device, files, bytes, updatedAt: ledger.updatedAt ?? null, self: ledger.device === me })
+    map.set(key, { device: key, files, bytes, updatedAt: ledger.updatedAt ?? null, self: key === selfId })
   }
   for (const info of attribution.values()) {
     if (info.device === null) continue
-    const entry = map.get(info.device) ?? { device: info.device, files: 0, bytes: 0, updatedAt: null, self: info.device === me }
+    const entry = map.get(info.device) ?? { device: info.device, files: 0, bytes: 0, updatedAt: null, self: info.device === selfId }
     entry.files += 1
     if (info.at !== null && (entry.updatedAt === null || Date.parse(entry.updatedAt) < info.at)) {
       entry.updatedAt = new Date(info.at).toISOString()
@@ -514,12 +523,12 @@ export function devicesFromLedgers(home, me) {
     map.set(info.device, entry)
   }
   const self = walkSessions(home)
-  map.set(me, {
-    ...(map.get(me) ?? {}),
-    device: me,
+  map.set(selfId, {
+    ...(map.get(selfId) ?? {}),
+    device: selfId,
     files: self.reduce((n, s) => n + s.logs.length, 0),
     bytes: self.reduce((n, s) => n + s.logs.reduce((b, l) => b + l.bytes, 0), 0),
-    updatedAt: map.get(me)?.updatedAt ?? new Date().toISOString(),
+    updatedAt: map.get(selfId)?.updatedAt ?? new Date().toISOString(),
     self: true,
   })
   return [...map.values()].sort((a, b) => (a.self === b.self ? String(a.device).localeCompare(String(b.device)) : a.self ? -1 : 1))
