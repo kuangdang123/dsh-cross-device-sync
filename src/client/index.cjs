@@ -64,24 +64,40 @@ function SyncIcon(props) {
 const rowStyle = { display: 'flex', gap: '8px', alignItems: 'baseline', padding: '4px 0', fontSize: '12px' }
 const dim = { opacity: 0.6 }
 
+/** 相对时间：面板里比绝对时间戳好读，省去每次换算。 */
+function fmtAgo(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return '—'
+  const diff = Date.now() - ms
+  if (diff < 60_000) return '刚刚'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`
+  return `${Math.floor(diff / 86_400_000)} 天前`
+}
+const shortTime = ms => (typeof ms === 'number' && Number.isFinite(ms) ? new Date(ms).toLocaleString() : '—')
+
 function DeviceSection(props) {
   const { status, selected, onSelect } = props
   const devices = status && status.devices ? status.devices : []
   const label = device => {
     if (device === 'all') return '全部设备'
     const found = devices.find(d => d.device === device)
-    return `${found && found.self ? '本机 · ' : ''}${String(device).slice(0, 8)}${found ? ` (${found.files})` : ''}`
+    const when = found && found.updatedAt ? ` · ${fmtAgo(Date.parse(found.updatedAt))}` : ''
+    return `${found && found.self ? '本机 · ' : ''}${String(device).slice(0, 8)}${found ? ` (${found.files})` : ''}${when}`
   }
   return h(
     'div',
     { style: { display: 'flex', flexWrap: 'wrap', gap: '6px', margin: '8px 0' } },
-    ['all'].concat(devices.map(d => d.device)).map(id =>
-      h(
+    ['all'].concat(devices.map(d => d.device)).map(id => {
+      const found = devices.find(d => d.device === id)
+      const title = id === 'all'
+        ? '不筛选'
+        : `${id}\n文件 ${found?.files ?? 0} · 最后活动 ${found?.updatedAt ? shortTime(Date.parse(found.updatedAt)) : '未知'}`
+      return h(
         'button',
         {
           key: id,
           type: 'button',
-          title: id === 'all' ? '不筛选' : id,
+          title,
           onClick: () => onSelect(id),
           style: {
             padding: '2px 10px',
@@ -95,8 +111,8 @@ function DeviceSection(props) {
           },
         },
         label(id),
-      ),
-    ),
+      )
+    }),
   )
 }
 
@@ -106,22 +122,24 @@ function SessionList(props) {
   return h(
     'div',
     null,
-    rows.slice(0, 300).map(s =>
-      h(
+    rows.slice(0, 300).map(s => {
+      const at = typeof s.updatedAt === 'number' ? s.updatedAt : Date.parse(s.updatedAt)
+      return h(
         'button',
         {
           key: s.rel,
           type: 'button',
           onClick: () => props.onOpen(s.rel),
-          title: '只读打开这条会话（不会改动原文件）',
+          title: `只读打开这条会话（不会改动原文件）\n最后改动：${shortTime(at)}（${s.device ? s.device.slice(0, 8) : '未知设备'}）`,
           style: { ...rowStyle, display: 'flex', width: '100%', textAlign: 'left', background: 'transparent', color: 'inherit', border: 'none', borderBottom: '1px solid currentColor', cursor: 'pointer', font: 'inherit' },
         },
-        h('span', { style: { minWidth: '160px', ...dim } }, s.project.replace(/^-+|-+$/g, '') || 'root'),
-        h('span', { style: { fontFamily: 'ui-monospace, monospace' } }, s.id.slice(0, 20)),
-        h('span', { style: dim }, s.cwd || '(无 cwd)'),
-        h('span', { style: { marginLeft: 'auto', ...dim } }, s.device ? s.device.slice(0, 8) : '—', ' · ', fmtMB(s.bytes)),
-      ),
-    ),
+        h('span', { style: { minWidth: '150px', ...dim } }, s.project.replace(/^-+|-+$/g, '') || 'root'),
+        h('span', { style: { fontFamily: 'ui-monospace, monospace' } }, s.id.slice(0, 18)),
+        // 时间放在设备标记旁边：一眼看出"这条是谁、什么时候写的"
+        h('span', { style: { marginLeft: 'auto', ...dim, whiteSpace: 'nowrap' } }, fmtAgo(at)),
+        h('span', { style: { ...dim, minWidth: '150px', textAlign: 'right' } }, `${s.device ? s.device.slice(0, 8) : '—'} · ${fmtMB(s.bytes)}`),
+      )
+    }),
   )
 }
 
@@ -254,9 +272,23 @@ function Panel() {
       ? h(
           'div',
           { style: { ...dim, fontSize: '12px' } },
-          `本机 ${String(status.device).slice(0, 8)} · ${status.sessions} 个会话 / ${fmtMB(status.bytes)} · `,
-          `远端更新 ${status.remoteAhead ? status.remoteAhead.length : 0} · 冲突 ${conflicts} · `,
-          status.git && status.git.repo ? `git ${status.git.remote ? '已连远端' : '未配远端'}` : 'git 未初始化',
+          h(
+            'div',
+            null,
+            `本机 ${String(status.device).slice(0, 8)} · ${status.sessions} 个会话 / ${fmtMB(status.bytes)} · `,
+            `远端更新 ${status.remoteAhead ? status.remoteAhead.length : 0} · 冲突 ${conflicts} · `,
+            status.git && status.git.repo ? `git ${status.git.remote ? '已连远端' : '未配远端'}` : 'git 未初始化',
+          ),
+          // 最后同步时间：来自仓库最近一次提交，同时给出提交者（即哪台设备）
+          status.lastSync
+            ? h(
+                'div',
+                { title: `${status.lastSync.subject || ''}` },
+                `最后同步 ${fmtAgo(status.lastSync.at)}（${shortTime(status.lastSync.at)}`,
+                status.lastSync.author ? ` · 设备 ${String(status.lastSync.author).slice(0, 8)}` : '',
+                '）',
+              )
+            : h('div', null, '尚无同步提交'),
         )
       : h('div', { style: { ...dim, fontSize: '12px' } }, '读取中…'),
     h(
@@ -309,7 +341,8 @@ function Panel() {
       ? h(
           'div',
           { style: { ...dim, fontSize: '11px', marginTop: '12px' } },
-          `最近更新：${fmtTime(Math.max(...sessions.map(s => s.mtimeMs)))}。跨设备继续会话需要该会话的 cwd 在本机存在，见 SYNC.md。`,
+          `共 ${rows.length} 条；最新一条 ${fmtAgo(Math.max(...sessions.map(s => (typeof s.updatedAt === 'number' ? s.updatedAt : Date.parse(s.updatedAt) || 0))))}。`,
+          '跨设备继续会话需要该会话的 cwd 在本机存在，见 SYNC.md。',
         )
       : null,
   )

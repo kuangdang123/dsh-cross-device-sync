@@ -232,6 +232,7 @@ export function verifyAll(home, { full = false } = {}) {
 export function sessionSummaries(home) {
   const me = deviceId(home)
   const ledgers = allLedgers(home)
+  const attribution = gitAttribution(home)
   const owner = new Map()
   for (const ledger of ledgers) {
     for (const rel of Object.keys(ledger.files ?? {})) owner.set(rel, ledger.device)
@@ -256,9 +257,10 @@ export function sessionSummaries(home) {
         cwd: header?.cwd ?? null,
         createdAt: header?.createdAt ?? null,
         preset: header?.agentPreset ?? null,
-        // 没有台账归属的文件一定是本机产物（拉来的会话会被对方台账标上设备），
-        // 默认记为本机——否则面板按设备筛选时会把自己刚写的东西全滤掉。
-        device: owner.get(log.rel) ?? me,
+        // 归属优先级：git 提交作者（随仓库旅行、最可信）→ 本机台账 → 本机。
+        // 拉来的会话若没有 git 归属，才会落到"本机"这个兜底上。
+        device: attribution.get(log.rel)?.device ?? owner.get(log.rel) ?? me,
+        updatedAt: attribution.get(log.rel)?.at ?? log.mtimeMs,
       })
     }
   }
@@ -305,6 +307,72 @@ export function writeLedger(home, id, sessions) {
 }
 
 const same = (a, b) => a !== undefined && b !== undefined && a.bytes === b.bytes && a.mtimeMs === b.mtimeMs
+
+/**
+ * 活跃会话的提交冷却（分钟）。
+ * 会话日志是 zstd 二进制，git 无法跨版本 delta；而活跃会话每个回合都在增长，
+ * 每同步一次就整份存一层新副本（实测平均每次同步 14.8 MB，最贵的那个文件被重写 6 次）。
+ * 让"最近 N 分钟内改动过"的会话在这一轮不提交，等它凉下来再进历史。
+ */
+export const DEFAULT_COMMIT_COOLDOWN_MINUTES = 10
+
+/** 把仍在冷却期内的会话从索引里撤下（它们还会继续增长）。返回被延后的路径。 */
+function unstageHotSessions(home, sessions, cooldownMinutes) {
+  if (!(cooldownMinutes > 0)) return []
+  const cutoff = Date.now() - cooldownMinutes * 60_000
+  const hot = sessions.flatMap(s => s.logs).filter(l => l.mtimeMs >= cutoff).map(l => l.rel)
+  if (hot.length === 0) return []
+  // 分批 reset，避免命令行长度上限。
+  for (let i = 0; i < hot.length; i += 100) {
+    git(home, ['reset', '-q', '--', ...hot.slice(i, i + 100)])
+  }
+  return hot
+}
+
+/**
+ * 从 git 历史读出每个文件"最后是谁、什么时候改的"。
+ *
+ * 为什么用它而不是台账：台账在 `.dsh-sync/` 里、被 .gitignore 排除，**不随仓库旅行**——
+ * 于是别的设备拉过去的会话在本机全被误判成"本机"。而 git 提交本身就带作者与时间，
+ * 一次 `git log --name-only` 就能拿到全部归属，且随仓库天然同步。
+ *
+ * 作者名约定 `dsh-<设备短 id>`（由 sync 写入仓库本地 user.name）。
+ * @param home - DSH_HOME（须是 git 仓库）
+ * @returns Map<相对路径, { device, at }>；非 git 仓库返回空 Map
+ */
+export function gitAttribution(home) {
+  const out = new Map()
+  if (!isRepo(home)) return out
+  const r = git(home, ['log', '--date=unix', '--pretty=format:\u0001%an\u0001%at', '--name-only', '--', 'sessions'])
+  if (r.status !== 0) return out
+  let device = null
+  let at = null
+  for (const line of (r.stdout ?? '').split('\n')) {
+    if (line.startsWith('\u0001')) {
+      const [, author, stamp] = line.split('\u0001')
+      device = author !== undefined && author.startsWith('dsh-') ? author.slice(4) : (author ?? null)
+      at = stamp !== undefined ? Number(stamp) * 1000 : null
+      continue
+    }
+    const path = line.trim()
+    if (path.length === 0 || device === null) continue
+    // 新→旧遍历，先出现的即"最后一次改动"
+    if (!out.has(path)) out.set(path, { device, at })
+  }
+  return out
+}
+
+/** 把本机设备身份写进仓库本地 git 身份，使提交自带归属。幂等。 */
+export function ensureAttributionIdentity(home, device) {
+  if (!isRepo(home)) return { changed: false }
+  const name = `dsh-${device.slice(0, 8)}`
+  const email = `${device.slice(0, 8)}@dsh.local`
+  const current = (git(home, ['config', '--local', 'user.name'], { quiet: true }).stdout ?? '').trim()
+  if (current === name) return { changed: false, name }
+  git(home, ['config', '--local', 'user.name', name])
+  git(home, ['config', '--local', 'user.email', email])
+  return { changed: true, name }
+}
 
 /** 三方比较：我的旧台账 / 本地现状 / 其他设备台账。 */
 export function classify(home, sessions, me) {
@@ -423,23 +491,51 @@ export function guardNeverSync(home) {
 }
 
 // ── 对外动作 ────────────────────────────────────────────────────────────────
-/** 台账里的设备清单：UI 的「设备筛选」用它，本机永远在列（即使还没写过台账）。 */
+/**
+ * 设备清单：UI 的「设备筛选」与「最后同步时间」用它。
+ * 数据来源按可信度合并：git 提交作者（随仓库旅行）→ 本机台账 → 本机。
+ * 本机永远在列，且计数来自真实文件（不是台账快照），否则刚写完还没同步时会显示 0。
+ */
 export function devicesFromLedgers(home, me) {
   const map = new Map()
+  const attribution = gitAttribution(home)
   for (const ledger of allLedgers(home)) {
     const files = Object.keys(ledger.files ?? {}).length
     const bytes = Object.values(ledger.files ?? {}).reduce((sum, f) => sum + (typeof f?.bytes === 'number' ? f.bytes : 0), 0)
     map.set(ledger.device, { device: ledger.device, files, bytes, updatedAt: ledger.updatedAt ?? null, self: ledger.device === me })
   }
+  for (const info of attribution.values()) {
+    if (info.device === null) continue
+    const entry = map.get(info.device) ?? { device: info.device, files: 0, bytes: 0, updatedAt: null, self: info.device === me }
+    entry.files += 1
+    if (info.at !== null && (entry.updatedAt === null || Date.parse(entry.updatedAt) < info.at)) {
+      entry.updatedAt = new Date(info.at).toISOString()
+    }
+    map.set(info.device, entry)
+  }
   const self = walkSessions(home)
   map.set(me, {
+    ...(map.get(me) ?? {}),
     device: me,
     files: self.reduce((n, s) => n + s.logs.length, 0),
     bytes: self.reduce((n, s) => n + s.logs.reduce((b, l) => b + l.bytes, 0), 0),
-    updatedAt: map.get(me)?.updatedAt ?? null,
+    updatedAt: map.get(me)?.updatedAt ?? new Date().toISOString(),
     self: true,
   })
   return [...map.values()].sort((a, b) => (a.self === b.self ? String(a.device).localeCompare(String(b.device)) : a.self ? -1 : 1))
+}
+
+/** 本仓库最近一次提交（＝本机最后一次同步）：时间与提交数。 */
+export function lastSyncInfo(home) {
+  if (!isRepo(home)) return null
+  const out = (git(home, ['log', '-1', '--date=unix', '--pretty=format:%at\u0001%an\u0001%s'], { quiet: true }).stdout ?? '').trim()
+  if (out.length === 0) return null
+  const [at, author, subject] = out.split('\u0001')
+  return {
+    at: at !== undefined ? Number(at) * 1000 : null,
+    author: author !== undefined && author.startsWith('dsh-') ? author.slice(4) : (author ?? null),
+    subject: subject ?? '',
+  }
 }
 
 export function status(home) {
@@ -453,6 +549,7 @@ export function status(home) {
   return {
     device: me,
     devices: devicesFromLedgers(home, me),
+    lastSync: lastSyncInfo(home),
     sessions: sessions.length,
     files: rows.length,
     bytes: rows.reduce((a, r) => a + r.bytes, 0),
@@ -495,8 +592,8 @@ export function preflight(home, { me } = {}) {
 }
 
 /** 一次同步：拉配置 → 校验 → 记台账 → 提交推送。任一步失败即停。 */
-export function sync(home, { commit = true, push = true } = {}) {
-  const result = { pulled: false, pushed: false, committed: false, ignored: null, preflight: null, error: null }
+export function sync(home, { commit = true, push = true, cooldownMinutes = DEFAULT_COMMIT_COOLDOWN_MINUTES } = {}) {
+  const result = { pulled: false, pushed: false, committed: false, ignored: null, identity: null, deferred: [], preflight: null, error: null }
   try {
     const pre = preflight(home)
     result.preflight = pre
@@ -515,8 +612,13 @@ export function sync(home, { commit = true, push = true } = {}) {
     result.ignored = guardNeverSync(home)
     writeLedger(home, pre.device, pre.sessions)
     if (!commit) return result
+    // 归属靠提交作者：把本机身份写进仓库本地 git 身份（幂等、只影响本仓库）。
+    result.identity = ensureAttributionIdentity(home, pre.device)
     git(home, ['add', '-A'])
-    const message = `sync(${pre.device.slice(0, 8)}): ${new Date().toISOString()}`
+    // 会话是 zstd 二进制，git 无法跨版本 delta：一个还在长的会话每同步一次就整份存一层。
+    // 所以"冷却未完成"的会话这一轮不提交（取消暂存），留给后面的同步——它们还会继续变。
+    result.deferred = unstageHotSessions(home, pre.sessions, cooldownMinutes)
+    const message = `sync(${pre.device.slice(0, 8)}): ${new Date().toISOString()}${result.deferred.length > 0 ? ` (+${result.deferred.length} 个活跃会话延后)` : ''}`
     const c = git(home, ['commit', '-m', message])
     if (c.status !== 0 && !/nothing to commit/.test(`${c.stdout}${c.stderr}`)) throw new Error('git commit 失败')
     result.committed = true
