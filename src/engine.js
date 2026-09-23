@@ -769,9 +769,14 @@ export function syncManagedIgnores(home) {
     counts[block.title] = entries.length
     const begin = ignoreBegin(block.title)
     const end = ignoreEnd(block.title)
-    const start = rest.indexOf(begin)
-    const stop = rest.indexOf(end)
-    if (start >= 0 && stop > start) rest = rest.slice(0, start) + rest.slice(stop + end.length)
+    // 循环剥离：同一区块可能在文件里出现多次（旧版本写过一遍、新版本又追加一遍），
+    // 只剥一次会让 .gitignore 越滚越长，且看起来像"规则没生效"。
+    for (;;) {
+      const start = rest.indexOf(begin)
+      const stop = rest.indexOf(end)
+      if (start < 0 || stop <= start) break
+      rest = rest.slice(0, start) + rest.slice(stop + end.length)
+    }
     if (entries.length > 0) bodies.push([begin, ...entries, end].join('\n'))
   }
   const head = rest.replace(/\s+$/, '')
